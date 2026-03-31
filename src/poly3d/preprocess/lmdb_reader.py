@@ -50,12 +50,19 @@ def iter_lmdb(path: str | Path) -> Generator[dict, None, None]:
     )
     with env.begin() as txn:
         cursor = txn.cursor()
-        for _key, val in cursor.iternext():
+        for key, val in cursor.iternext():
             raw = _decompress(val)
             try:
-                yield json.loads(raw)
+                obj = json.loads(raw)
             except Exception:
                 continue
+
+            if not isinstance(obj, dict):
+                continue
+            if 'numbers' not in obj or 'positions' not in obj or 'data' not in obj:
+                continue
+
+            yield obj
     env.close()
 
 

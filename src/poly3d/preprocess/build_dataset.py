@@ -38,7 +38,7 @@ def _process_record(
     """
     from rdkit import Chem
     from rdkit.Chem import rdDetermineBonds
-    from model.features import mol_to_data
+    from poly3d.model.features import mol_to_data
 
     atomic_nums, positions, charge, sid = args
 
@@ -117,27 +117,58 @@ class DatasetBuilder:
         )
 
         total_ok = total_skip = 0
-        ctx = mp.get_context('spawn')
 
-        with ctx.Pool(processes=self.n_workers) as pool:
-            txn = env.begin(write=True)
+        def handle_payload(txn, payload):
+            nonlocal total_ok, total_skip
+            if payload is None:
+                total_skip += 1
+                return txn
+            key = f'{total_ok:09d}'.encode('ascii')
+            txn.put(key, payload)
+            total_ok += 1
+            if total_ok % 10_000 == 0:
+                txn.commit()
+                txn = env.begin(write=True)
+            return txn
 
-            for lmdb_file in tqdm(lmdb_files, desc='Files', unit='file'):
-                args_iter = (read_molecule(rec) for rec in iter_lmdb(lmdb_file))
-                results = pool.imap_unordered(_process_record, args_iter, chunksize=self.chunk_size)
+        # ctx = mp.get_context('spawn')
 
-                for payload in results:
-                    if payload is None:
-                        total_skip += 1
-                        continue
-                    key = f'{total_ok:09d}'.encode('ascii')
-                    txn.put(key, payload)
-                    total_ok += 1
-                    if total_ok % 10_000 == 0:
-                        txn.commit()
-                        txn = env.begin(write=True)
+        # with ctx.Pool(processes=self.n_workers) as pool:
+        #     txn = env.begin(write=True)
 
-            txn.commit()
+        #     for lmdb_file in tqdm(lmdb_files, desc='Files', unit='file'):
+        #         args_iter = (read_molecule(rec) for rec in iter_lmdb(lmdb_file))
+        #         results = pool.imap_unordered(_process_record, args_iter, chunksize=self.chunk_size)
+
+        #         for payload in results:
+        #             if payload is None:
+        #                 total_skip += 1
+        #                 continue
+        #             key = f'{total_ok:09d}'.encode('ascii')
+        #             txn.put(key, payload)
+        #             total_ok += 1
+        #             if total_ok % 10_000 == 0:
+        #                 txn.commit()
+        #                 txn = env.begin(write=True)
+
+        #     txn.commit()
+        txn = env.begin(write=True)
+
+        for lmdb_file in tqdm(lmdb_files, desc='Files', unit='file'):
+            if self.n_workers <= 1:
+                for rec_idx, rec in enumerate(iter_lmdb(lmdb_file)):
+                    args = read_molecule(rec)   # ここで本当の例外を見えるようにする
+                    payload = _process_record(args)
+                    txn = handle_payload(txn, payload)
+            else:
+                ctx = mp.get_context('spawn')
+                with ctx.Pool(processes=self.n_workers) as pool:
+                    args_iter = (read_molecule(rec) for rec in iter_lmdb(lmdb_file))
+                    results = pool.imap_unordered(_process_record, args_iter, chunksize=self.chunk_size)
+                    for payload in results:
+                        txn = handle_payload(txn, payload)
+
+        txn.commit()
 
         with env.begin(write=True) as txn:
             txn.put(b'__len__', str(total_ok).encode('ascii'))
