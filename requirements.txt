@@ -1,0 +1,12 @@
+# 既に polygen 環境にインストール済みのもの
+torch>=2.0.0
+torch-geometric>=2.0.0
+rdkit>=2023.0.0
+lmdb>=1.4.0
+numpy>=1.24.0
+tqdm>=4.65.0
+einops>=0.7.0
+
+# torch_scatter は torch-geometric に含まれる場合あり
+# インストール方法: pip install torch-scatter -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
+torch-scatter

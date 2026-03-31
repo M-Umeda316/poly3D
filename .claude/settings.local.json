@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/Dataset/OMol_base/OPoly26/**)",
+      "Read(//d/Dataset/OMol_base/OPoly26/train/**)",
+      "Read(//d/Dataset/OMol_base/OPoly26/val/**)",
+      "Bash(conda info:*)",
+      "Bash(conda run:*)",
+      "Bash(conda activate:*)",
+      "Bash(python scripts/inspect_lmdb.py)",
+      "Bash(\"C:/Users/shanu/anaconda3/envs/polygen/python.exe\" scripts/inspect_lmdb.py)",
+      "Bash(\"C:/Users/shanu/anaconda3/envs/polygen/python.exe\" scripts/inspect_lmdb2.py)",
+      "Bash(\"C:/Users/shanu/anaconda3/envs/polygen/python.exe\" scripts/test_pipeline.py)",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(\"C:/Users/shanu/anaconda3/envs/polygen/python.exe\" -c \":*)",
+      "Bash(\"C:/Users/shanu/anaconda3/envs/polygen/python.exe\" -m pip install pymupdf)"
+    ]
+  }
+}
