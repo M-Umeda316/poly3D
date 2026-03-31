@@ -84,16 +84,14 @@ def vae_loss(
         quartets = build_dihedral_quartets(edge_index, num_nodes)
     l_dihedral = dihedral_loss(pos_pred, pos_gt, quartets)
 
-    # KL
-    l_kl = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).mean()
+    # KL（logvar は VAEEncoder で clamp 済みだが念のため再 clamp）
+    logvar_safe = logvar.clamp(-10.0, 10.0)
+    l_kl = (-0.5 * (1 + logvar_safe - mu.pow(2) - logvar_safe.exp())).mean()
 
-    total = (
-        w_pos * l_pos
-        + w_bond * l_bond
-        + w_angle * l_angle
-        + w_dihedral * l_dihedral
-        + beta * l_kl
-    )
+    total = w_pos * l_pos + w_bond * l_bond + w_angle * l_angle + w_dihedral * l_dihedral
+    # beta=0 のとき 0*NaN=NaN になるのを避けるため明示的にガード
+    if beta > 0.0:
+        total = total + beta * l_kl
 
     loss_dict = {
         'total': total.item(),

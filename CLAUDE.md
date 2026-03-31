@@ -100,6 +100,14 @@ torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 \
     --out out.sdf --n_steps 100
 ```
 
+### TensorBoard
+
+```bash
+tensorboard --logdir ./runs/polygen_v1
+# VAE ログ: runs/polygen_v1/tb_vae/
+# DiT ログ: runs/polygen_v1/tb_dit/
+```
+
 ## ディレクトリ構成
 
 ```
@@ -176,8 +184,16 @@ SMILES → ConditionalEncoder → h_cond, e_cond, Ci
 - DataLoader の `num_workers > 0` 時は worker ごとに lmdb env を開く（`worker_init_fn`）
 - 元素記号には必ず `Chem.GetPeriodicTable().GetElementSymbol(z)` を使う（`'X'` 不可）
 - RWPE は scipy.sparse で計算（scipy は polygen env に含まれる）
-- DiT は block-diagonal attention mask で分子間 cross-attention を遮断
+- DiT は attn_bias（(H,N,N) float）で分子間 cross-attention を遮断（異分子間 = -1e9）
 - VAE Decoder の初期座標は `init_pos MLP` で生成（全ゼロ禁止: EGNN の d²=0 問題）
+- DiT チェックポイントの `'flow'` キーは `LatentDiT.state_dict()` のみ（`model.*` プレフィックスなし）
+
+## 計算効率
+
+- **BFS（グラフ距離行列）**: 純 Python のため高コスト。`precompute_attn_inputs()` を 1 バッチ 1 回だけ呼ぶこと（FlowMatching が自動で行う）
+- **DiT Attention**: `F.scaled_dot_product_attention` を使用（Flash Attention 対応）
+- **attn_bias**: pos_bias + block-diagonal mask を (H,N,N) float に統合して DiTBlock に渡す
+- **DDP**: LatentDiT のみを DDP ラップ（FlowMatching はラップ不要）。`self.flow.model = DDP(dit, ...)` の形式
 
 ## 分散学習（DDP）
 

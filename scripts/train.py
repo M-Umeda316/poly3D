@@ -13,22 +13,18 @@ Stage 2: Latent DiT (Flow Matching)
 
 【マルチ GPU（単一ノード、4GPU の例）】
   torchrun --nproc_per_node=4 scripts/train.py \
-      --stage vae \
-      --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-      --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
-      --out_dir    ./runs/polygen_v1 --epochs 300
+      --stage vae ...
 
 【マルチノード（2ノード × 4GPU = 8GPU の例）】
   # node0 (master)
-  torchrun \
-      --nproc_per_node=4 --nnodes=2 --node_rank=0 \
-      --master_addr=<node0_ip> --master_port=29500 \
-      scripts/train.py --stage vae ...
+  torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 \
+      --master_addr=<ip> --master_port=29500 scripts/train.py --stage vae ...
   # node1
-  torchrun \
-      --nproc_per_node=4 --nnodes=2 --node_rank=1 \
-      --master_addr=<node0_ip> --master_port=29500 \
-      scripts/train.py --stage vae ...
+  torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 \
+      --master_addr=<ip> --master_port=29500 scripts/train.py --stage vae ...
+
+【TensorBoard】
+  tensorboard --logdir ./runs/polygen_v1
 """
 from __future__ import annotations
 
@@ -45,6 +41,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from poly3d.data.dataset import make_dataloader
@@ -53,7 +50,6 @@ from poly3d.model.vae import StructuralVAE
 from poly3d.model.dit import LatentDiT
 from poly3d.model.flow_matching import FlowMatching
 from poly3d.model.vae_loss import vae_loss
-from poly3d.model.geo_losses import build_angle_triplets, build_dihedral_quartets
 
 
 # ── 分散学習ユーティリティ ─────────────────────────────────────────────────────
@@ -69,7 +65,7 @@ def init_dist() -> tuple[int, int, int]:
     """
     local_rank = int(os.environ.get('LOCAL_RANK', -1))
     if local_rank < 0:
-        return 0, 0, 1  # シングル GPU / CPU
+        return 0, 0, 1   # シングル GPU / CPU
 
     dist.init_process_group(backend='nccl')
     global_rank = dist.get_rank()
@@ -97,13 +93,12 @@ def _unwrap(model: nn.Module) -> nn.Module:
 def _all_reduce_dict(d: dict[str, float], n: int, device: torch.device) -> tuple[dict[str, float], int]:
     """
     各ランクの (sums_dict, n_batches) を全ランクで集計し、
-    グローバル平均を返す。分散モードでなければ入力をそのまま返す。
+    グローバル合計を返す。分散モードでなければ入力をそのまま返す。
     """
     if not dist.is_initialized():
         return d, n
 
     keys = sorted(d.keys())
-    # キーごとの sum + n を 1 テンソルにまとめて 1 回 all_reduce
     vals = torch.tensor([d[k] for k in keys] + [float(n)], device=device)
     dist.all_reduce(vals, op=dist.ReduceOp.SUM)
     total_n = int(vals[-1].item())
@@ -229,21 +224,19 @@ class VAETrainer:
 
         params = (list(self.cond_encoder.parameters())
                   + list(self.vae.parameters()))
-        n_params = sum(p.numel() for p in params if p.requires_grad)
         if is_main_process():
+            n_params = sum(p.numel() for p in params if p.requires_grad)
             print(f'VAE パラメータ数: {n_params:,}')
 
         self.optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=args.epochs)
 
-        # DistributedSampler（分散モード時はシャッフルをサンプラーに委譲）
+        # DistributedSampler（分散モード時）
         self.train_sampler: Optional[DistributedSampler] = None
         if dist.is_initialized():
             from poly3d.data.dataset import ConformerDataset
             _ds = ConformerDataset(args.train_lmdb, max_atoms=args.max_atoms)
-            self.train_sampler = DistributedSampler(
-                _ds, shuffle=True, seed=args.seed,
-            )
+            self.train_sampler = DistributedSampler(_ds, shuffle=True, seed=args.seed)
 
         self.train_loader = make_dataloader(
             args.train_lmdb, batch_size=args.batch_size,
@@ -260,6 +253,11 @@ class VAETrainer:
         self.best_val_loss = float('inf')
         if args.resume:
             self._load(args.resume)
+
+        # TensorBoard（main process のみ）
+        self.writer: Optional[SummaryWriter] = None
+        if is_main_process():
+            self.writer = SummaryWriter(log_dir=str(self.out_dir / 'tb_vae'))
 
     def _get_beta(self, epoch: int) -> float:
         a = self.args
@@ -337,8 +335,7 @@ class VAETrainer:
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(
-                    list(self.cond_encoder.parameters())
-                    + list(self.vae.parameters()),
+                    list(self.cond_encoder.parameters()) + list(self.vae.parameters()),
                     self.args.grad_clip,
                 )
                 self.optimizer.step()
@@ -378,13 +375,28 @@ class VAETrainer:
                     f'(pos={va.get("pos",0):.4f} kl={va.get("kl",0):.4f}) | '
                     f'lr={lr:.2e} | {elapsed:.1f}s'
                 )
+
+                # CSV ログ
                 with open(log, 'a') as f:
                     f.write(f'{epoch},{beta:.4f},{tr.get("total",0):.6f},'
                             f'{va.get("total",0):.6f},{va.get("pos",0):.6f},'
                             f'{va.get("kl",0):.6f},{lr:.2e},{elapsed:.1f}\n')
 
+                # TensorBoard
+                if self.writer is not None:
+                    self.writer.add_scalar('Loss/train_total', tr.get('total', 0), epoch)
+                    self.writer.add_scalar('Loss/val_total', va.get('total', 0), epoch)
+                    for key in ('pos', 'bond', 'angle', 'dihedral', 'kl'):
+                        if key in va:
+                            self.writer.add_scalar(f'Loss/val_{key}', va[key], epoch)
+                    self.writer.add_scalar('Params/lr', lr, epoch)
+                    self.writer.add_scalar('Params/beta', beta, epoch)
+
                 if epoch % self.args.save_every == 0 or epoch == self.args.epochs:
                     self._save(epoch, va['total'])
+
+        if self.writer is not None:
+            self.writer.close()
 
 
 # ── DiT Trainer ────────────────────────────────────────────────────────────────
@@ -414,18 +426,21 @@ class DiTTrainer:
         self.vae.eval().requires_grad_(False)
 
         # DiT (学習対象)
-        dit = build_dit(args)
-        self.flow = FlowMatching(dit, t_max=args.t_max, p_selfcond=args.p_selfcond).to(self.device)
+        dit = build_dit(args).to(self.device)
+        self.flow = FlowMatching(dit, t_max=args.t_max, p_selfcond=args.p_selfcond)
 
-        # DDP ラップ（分散モード時のみ）
+        # DDP は LatentDiT のみに適用。
+        # FlowMatching.loss() 内で self.model(...)（DDP経由）を呼ぶため
+        # gradient sync が正しく発動する。
         if dist.is_initialized():
-            self.flow = DDP(self.flow, device_ids=[local_rank])
+            self.flow.model = DDP(dit, device_ids=[local_rank])
 
-        n_params = sum(p.numel() for p in self.flow.parameters() if p.requires_grad)
         if is_main_process():
+            n_params = sum(p.numel() for p in dit.parameters() if p.requires_grad)
             print(f'DiT パラメータ数: {n_params:,}')
 
-        self.optimizer = AdamW(self.flow.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        self.optimizer = AdamW(self.flow.parameters(), lr=args.lr,
+                               weight_decay=args.weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=args.epochs)
 
         # DistributedSampler
@@ -433,9 +448,7 @@ class DiTTrainer:
         if dist.is_initialized():
             from poly3d.data.dataset import ConformerDataset
             _ds = ConformerDataset(args.train_lmdb, max_atoms=args.max_atoms)
-            self.train_sampler = DistributedSampler(
-                _ds, shuffle=True, seed=args.seed,
-            )
+            self.train_sampler = DistributedSampler(_ds, shuffle=True, seed=args.seed)
 
         self.train_loader = make_dataloader(
             args.train_lmdb, batch_size=args.batch_size,
@@ -453,9 +466,14 @@ class DiTTrainer:
         if args.resume:
             self._load(args.resume)
 
+        # TensorBoard（main process のみ）
+        self.writer: Optional[SummaryWriter] = None
+        if is_main_process():
+            self.writer = SummaryWriter(log_dir=str(self.out_dir / 'tb_dit'))
+
     def _load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        _unwrap(self.flow).load_state_dict(ckpt['flow'])
+        _unwrap(self.flow.model).load_state_dict(ckpt['flow'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
         self.start_epoch = ckpt['epoch'] + 1
@@ -466,9 +484,10 @@ class DiTTrainer:
     def _save(self, epoch: int, val_loss: float):
         if not is_main_process():
             return
+        # DDP ラップを外してから保存（sample.py 側の load_state_dict と形式を合わせる）
         ckpt = {
             'epoch': epoch,
-            'flow': _unwrap(self.flow).state_dict(),
+            'flow': _unwrap(self.flow.model).state_dict(),   # LatentDiT の weights のみ
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'val_loss': val_loss,
@@ -504,7 +523,7 @@ class DiTTrainer:
                 mu, _ = self.vae.encoder(
                     cond, batch.pos, batch.edge_index, e_cond, batch.batch
                 )
-                z0 = mu  # deterministic latent
+                z0 = mu   # deterministic latent
 
             with torch.set_grad_enabled(train):
                 loss, ld = self.flow.loss(
@@ -549,21 +568,28 @@ class DiTTrainer:
                     f'train={tr["flow"]:.4f} | val={va["flow"]:.4f} | '
                     f'lr={lr:.2e} | {elapsed:.1f}s'
                 )
+
+                # CSV ログ
                 with open(log, 'a') as f:
                     f.write(f'{epoch},{tr.get("flow",0):.6f},{va.get("flow",0):.6f},'
                             f'{lr:.2e},{elapsed:.1f}\n')
 
+                # TensorBoard
+                if self.writer is not None:
+                    self.writer.add_scalar('Loss/train_flow', tr.get('flow', 0), epoch)
+                    self.writer.add_scalar('Loss/val_flow', va.get('flow', 0), epoch)
+                    self.writer.add_scalar('Params/lr', lr, epoch)
+
                 if epoch % self.args.save_every == 0 or epoch == self.args.epochs:
                     self._save(epoch, va['flow'])
+
+        if self.writer is not None:
+            self.writer.close()
 
 
 # ── utils ───────────────────────────────────────────────────────────────────────
 
 def _resolve_device(device_str: str, local_rank: int) -> torch.device:
-    """
-    分散モード時は local_rank の GPU を使う。
-    シングルモード時は device_str（'auto' なら CUDA 自動検出）。
-    """
     if dist.is_initialized():
         return torch.device(f'cuda:{local_rank}')
     if device_str == 'auto':

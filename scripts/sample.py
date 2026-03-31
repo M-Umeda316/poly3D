@@ -88,8 +88,9 @@ def load_models(vae_path: str, dit_path: str, device: torch.device):
         n_heads=dit_args.dit_n_heads,
         n_layers=dit_args.dit_n_layers,
     ).to(device)
-    flow = FlowMatching(dit, t_max=dit_args.t_max).to(device)
-    flow.load_state_dict(dit_ckpt['flow'])
+    # チェックポイントには LatentDiT の weights のみ保存されている
+    dit.load_state_dict(dit_ckpt['flow'])
+    flow = FlowMatching(dit, t_max=dit_args.t_max)
     flow.eval()
 
     return cond_encoder, vae, flow

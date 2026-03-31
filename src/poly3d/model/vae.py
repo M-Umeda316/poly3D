@@ -78,7 +78,9 @@ class VAEEncoder(nn.Module):
         h0 = self.input_proj(cond)   # (N, hidden_dim)
         h, _ = self.egnn(h0, pos, edge_index, e_cond, batch)
         mu = self.mu_head(h)
-        logvar = self.logvar_head(h)
+        # exp(logvar) が float32 でオーバーフローしないよう clamp
+        # exp(10) ≈ 22026（十分大きな分散）、exp(-10) ≈ 4.5e-5（ほぼ決定論的）
+        logvar = self.logvar_head(h).clamp(-10.0, 10.0)
         return mu, logvar
 
 
@@ -112,8 +114,11 @@ class VAEDecoder(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, 3),
         )
-        # 初期座標は小さい値に初期化（学習初期の爆発防止）
-        nn.init.zeros_(self.init_pos[-1].weight)
+        # 最終層を小さい乱数で初期化。
+        # zeros だと x0 が全ノード同一（=0）になり EGNN の d²=0 で区別不能。
+        # 勾配も ∂(cross_product)/∂x ~ 1/eps = 1e8 になり爆発する。
+        # std=0.01 程度の小さな値で非ゼロな初期座標を保証する。
+        nn.init.normal_(self.init_pos[-1].weight, std=0.01)
         nn.init.zeros_(self.init_pos[-1].bias)
 
         self.egnn = EGNN(

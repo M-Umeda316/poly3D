@@ -73,6 +73,9 @@ class EGNNLayer(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        # ノード特徴量爆発を防ぐ LayerNorm
+        self.node_norm = nn.LayerNorm(hidden_dim)
+
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -92,7 +95,7 @@ class EGNNLayer(nn.Module):
 
         # ─── エッジメッセージ ───
         diff = x[src] - x[dst]                     # (E, 3)
-        dist_sq = (diff.pow(2)).sum(dim=-1, keepdim=True)   # (E, 1)
+        dist_sq = (diff.pow(2)).sum(dim=-1, keepdim=True).clamp(max=100.0)   # (E, 1)
 
         edge_in = torch.cat([h[src], h[dst], dist_sq, edge_attr], dim=-1)
         m = self.edge_mlp(edge_in)                  # (E, hidden_dim)
@@ -115,6 +118,10 @@ class EGNNLayer(nn.Module):
             ).clamp(min=1.0).unsqueeze(-1)          # (N, 1)
             coord_delta = coord_delta / n_neighbors
 
+        # scatter 後に再クランプ（diff * coord_w の積が大きい場合に備える）
+        if self.coord_clamp > 0:
+            coord_delta = coord_delta.clamp(-self.coord_clamp, self.coord_clamp)
+
         x_new = x + coord_delta                     # (N, 3)
 
         # ─── ノード更新 ───
@@ -127,9 +134,9 @@ class EGNNLayer(nn.Module):
         h_delta = self.node_mlp(node_in)            # (N, hidden_dim)
 
         if self.residual:
-            h_new = h + h_delta
+            h_new = self.node_norm(h + h_delta)
         else:
-            h_new = h_delta
+            h_new = self.node_norm(h_delta)
 
         return h_new, x_new
 

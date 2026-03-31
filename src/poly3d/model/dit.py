@@ -16,9 +16,15 @@ Latent Diffusion Transformer (DiT)
   t     : (B,) float       時刻
   batch : (N,) int         各ノードのバッチ番号
   z_sc  : (N, latent_dim) self-conditioning（None → ゼロ）
+  attn_bias : (H, N, N) float  precompute_attn_inputs() の出力（省略時は内部計算）
 
 出力:
   z1_pred : (N, latent_dim)  Z1 の予測（velocity）
+
+パフォーマンスメモ:
+  attn_bias は BFS（CPU Python）を含むため計算コストが高い。
+  FlowMatching.loss / sample から precompute_attn_inputs() を 1 バッチ 1 回だけ
+  呼び出し、その結果を attn_bias として渡すこと（学習時 2× 削減、サンプリング時 100× 削減）。
 """
 from __future__ import annotations
 
@@ -49,9 +55,7 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 def _build_block_diagonal_mask(batch: Tensor) -> Tensor:
-    """
-    batch (N,) → (N, N) bool mask。同じ分子内のノードペアのみ True。
-    """
+    """batch (N,) → (N, N) bool mask。同じ分子内のノードペアのみ True。"""
     return batch.unsqueeze(0) == batch.unsqueeze(1)   # (N, N)
 
 
@@ -62,7 +66,7 @@ def _build_batch_pos_bias(
     """
     バッチ内の各分子ごとにグラフ距離 → one-hot → bias を計算し、
     block-diagonal な (N, N, n_heads) テンソルに詰める。
-    異なる分子間は 0 (attention mask で -inf にされるので問題ない)。
+    異なる分子間は 0（attn_bias で -1e9 に上書きされるので問題ない）。
     """
     device = edge_index.device
     B = int(batch.max().item()) + 1
@@ -76,28 +80,30 @@ def _build_batch_pos_bias(
         if n_b == 0:
             continue
 
-        # この分子に属するエッジを抽出してローカルインデックスに変換
         offset = node_indices[0].item()
         src, dst = edge_index
         edge_mask = node_mask[src] & node_mask[dst]
-        local_ei = edge_index[:, edge_mask] - offset  # (2, E_b)
+        local_ei = edge_index[:, edge_mask] - offset   # (2, E_b)
 
         dist_mat = compute_graph_distance(local_ei, n_b)
-        oh = dist_to_onehot(dist_mat)           # (n_b, n_b, 5)
-        local_bias = bias_module(oh)             # (n_b, n_b, n_heads)
+        oh = dist_to_onehot(dist_mat)                  # (n_b, n_b, 5)
+        local_bias = bias_module(oh)                    # (n_b, n_b, n_heads)
 
-        # block-diagonal に配置
         idx = node_indices
         bias[idx.unsqueeze(1), idx.unsqueeze(0)] = local_bias
 
-    return bias
+    return bias   # (N, N, n_heads)
 
 
 class DiTBlock(nn.Module):
     """
     1 層の DiT ブロック。
 
-    Pre-LN → Multi-Head Attention (+ positional bias + block-diagonal mask) → FFN
+    Pre-LN → F.scaled_dot_product_attention (Flash Attention) → FFN
+
+    attn_bias は (H, N, N) float。
+    - 同分子内: pos_bias 値（use_pos_bias=False なら 0）
+    - 異分子間: -1e9（softmax で実質ゼロになりクロス分子 attention を遮断）
     """
 
     def __init__(
@@ -112,6 +118,7 @@ class DiTBlock(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_heads = n_heads
         self.head_dim = hidden_dim // n_heads
+        self.dropout = dropout
 
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
@@ -127,47 +134,37 @@ class DiTBlock(nn.Module):
             nn.Linear(ffn_dim, hidden_dim),
             nn.Dropout(dropout),
         )
-        self.attn_drop = nn.Dropout(dropout)
 
     def forward(
         self,
         x: Tensor,
-        attn_mask: Optional[Tensor] = None,
-        bias: Optional[Tensor] = None,
+        attn_bias: Optional[Tensor] = None,   # (H, N, N) float
     ) -> Tensor:
         """
-        Parameters
-        ----------
         x         : (N, hidden_dim)
-        attn_mask : (N, N) bool — True = attend, False = block
-        bias      : (N, N, n_heads) — positional bias
+        attn_bias : (H, N, N) float — pos_bias + block-diagonal mask を統合済み
         """
         N = x.size(0)
         h = self.norm1(x)
         qkv = self.qkv(h).reshape(N, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # (N, H, D)
+        q, k, v = qkv.unbind(dim=1)   # (N, H, D)
 
-        # (H, N, N) attention logit
-        scale = math.sqrt(self.head_dim)
-        attn = torch.einsum('ihd,jhd->hij', q, k) / scale  # (H, N, N)
+        # F.scaled_dot_product_attention: (B, H, N, D) 形式に変換
+        q = q.permute(1, 0, 2).unsqueeze(0)   # (1, H, N, D)
+        k = k.permute(1, 0, 2).unsqueeze(0)
+        v = v.permute(1, 0, 2).unsqueeze(0)
 
-        # Positional bias
-        if bias is not None:
-            attn = attn + bias.permute(2, 0, 1)   # (H, N, N)
+        # attn_bias: (H, N, N) → (1, H, N, N)
+        sdpa_mask = attn_bias.unsqueeze(0) if attn_bias is not None else None
 
-        # Block-diagonal mask: 異なる分子のペアは -inf
-        if attn_mask is not None:
-            attn = attn.masked_fill(~attn_mask.unsqueeze(0), float('-inf'))
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=sdpa_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+        )   # (1, H, N, D)
 
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-
-        # NaN 防止: 全マスクされた行は softmax が NaN になるので 0 に
-        attn = attn.nan_to_num(0.0)
-
-        out = torch.einsum('hij,jhd->ihd', attn, v).reshape(N, self.hidden_dim)
+        out = out.squeeze(0).permute(1, 0, 2).reshape(N, self.hidden_dim)
         x = x + self.out_proj(out)
-
-        # FFN
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -206,6 +203,7 @@ class LatentDiT(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
         self.use_pos_bias = use_pos_bias
 
         # Time embedding
@@ -239,14 +237,46 @@ class LatentDiT(nn.Module):
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
+    def precompute_attn_inputs(
+        self,
+        edge_index: Optional[Tensor],
+        batch: Tensor,
+        num_nodes: int,
+    ) -> Tensor:
+        """
+        グラフ距離 BFS とブロック対角マスクを 1 回計算し、
+        DiTBlock に渡す (H, N, N) float の combined attention bias を返す。
+
+          同分子内  : pos_bias 値 (use_pos_bias=False なら 0)
+          異分子間  : -1e9  (softmax で実質ゼロ → cross-molecule attention を遮断)
+
+        BFS は純 Python であり計算コストが高い。
+        FlowMatching.loss() / sample() から 1 バッチにつき 1 回だけ呼ぶこと。
+        """
+        device = batch.device
+        attn_mask = _build_block_diagonal_mask(batch)   # (N, N) bool
+
+        if self.pos_bias is not None and edge_index is not None:
+            pos_bias_val = _build_batch_pos_bias(
+                edge_index, batch, num_nodes, self.pos_bias
+            )                                            # (N, N, H)
+            combined = pos_bias_val.permute(2, 0, 1).contiguous()   # (H, N, N)
+        else:
+            combined = torch.zeros(self.n_heads, num_nodes, num_nodes, device=device)
+
+        # 異分子間を -1e9 でマスク
+        combined = combined.masked_fill(~attn_mask.unsqueeze(0), -1e9)
+        return combined   # (H, N, N) float
+
     def forward(
         self,
         zt: Tensor,            # (N, latent_dim)
         cond: Tensor,          # (N, cond_dim)
         t: Tensor,             # (B,) float  0〜1
         batch: Tensor,         # (N,) int
-        edge_index: Optional[Tensor] = None,  # (2, E) pos_bias 用
-        z_sc: Optional[Tensor] = None,
+        edge_index: Optional[Tensor] = None,   # pos_bias 計算用（attn_bias 未提供時のみ使用）
+        z_sc: Optional[Tensor] = None,         # self-conditioning
+        attn_bias: Optional[Tensor] = None,    # (H, N, N) precomputed — 毎回計算を避けるため
     ) -> Tensor:
         """
         Returns
@@ -256,8 +286,7 @@ class LatentDiT(nn.Module):
         N = zt.size(0)
 
         # Time embedding: t (B,) → (N, time_dim)
-        t_emb_b = self.time_emb(t)     # (B, time_dim)
-        t_emb = t_emb_b[batch]         # (N, time_dim)
+        t_emb = self.time_emb(t)[batch]   # (N, time_dim)
 
         if z_sc is None:
             z_sc = torch.zeros_like(zt)
@@ -265,38 +294,12 @@ class LatentDiT(nn.Module):
         # 入力結合
         x = self.input_proj(torch.cat([zt, cond, t_emb, z_sc], dim=-1))
 
-        # Block-diagonal attention mask
-        attn_mask = _build_block_diagonal_mask(batch)  # (N, N) bool
-
-        # Positional bias (分子ごとに計算して block-diagonal に詰める)
-        bias = None
-        if self.use_pos_bias and self.pos_bias is not None and edge_index is not None:
-            bias = _build_batch_pos_bias(edge_index, batch, N, self.pos_bias)
+        # attn_bias が未提供なら内部で計算（backward compat）
+        if attn_bias is None:
+            attn_bias = self.precompute_attn_inputs(edge_index, batch, N)
 
         # Transformer
         for block in self.blocks:
-            x = block(x, attn_mask, bias)
+            x = block(x, attn_bias)
 
-        z1_pred = self.out_proj(self.norm_out(x))
-        return z1_pred
-
-    def forward_with_selfcond(
-        self,
-        zt: Tensor,
-        cond: Tensor,
-        t: Tensor,
-        batch: Tensor,
-        edge_index: Optional[Tensor] = None,
-        p_selfcond: float = 0.5,
-    ) -> Tensor:
-        """
-        学習時の self-conditioning (2パス)。
-        p_selfcond の確率で1パス目の予測を2パス目に渡す。
-        """
-        if self.training and torch.rand(1).item() < p_selfcond:
-            with torch.no_grad():
-                z_sc = self.forward(zt, cond, t, batch, edge_index, z_sc=None).detach()
-        else:
-            z_sc = None
-
-        return self.forward(zt, cond, t, batch, edge_index, z_sc)
+        return self.out_proj(self.norm_out(x))

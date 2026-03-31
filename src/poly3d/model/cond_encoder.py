@@ -186,15 +186,21 @@ class ConditionalEncoder(nn.Module):
         cond   : (N, hidden_dim)  Ci = MLP([h; g_i])
         """
         # ── ノード初期特徴量 ───────────────────────────────────────────────
+        N = atom_type_idx.size(0)
+        dev = atom_type_idx.device
         node_parts = [
             self.atom_emb(atom_type_idx),   # (N, atom_emb_dim)
             self.hyb_emb(hyb_idx),          # (N, hyb_emb_dim)
             atom_cont,                       # (N, ATOM_CONT_DIM)
         ]
-        if self.use_rwpe and rwpe is not None:
-            node_parts.append(rwpe)
-        if self.use_lappe and lappe is not None:
-            node_parts.append(lappe)
+        if self.use_rwpe:
+            # rwpe が None の場合（データに含まれていないとき）はゼロで埋める
+            node_parts.append(rwpe if rwpe is not None
+                              else torch.zeros(N, RWPE_DIM, device=dev))
+        if self.use_lappe:
+            # lappe が None の場合も同様にゼロで埋める
+            node_parts.append(lappe if lappe is not None
+                              else torch.zeros(N, LAPPE_DIM, device=dev))
 
         h = self.node_proj(torch.cat(node_parts, dim=-1))   # (N, hidden_dim)
 
