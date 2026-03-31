@@ -59,19 +59,34 @@ cd C:/Users/shanu/Documents/Python/poly3D
 ### 学習（2段階）
 
 ```bash
-# Stage 1: Structural VAE
+# Stage 1: Structural VAE（シングル GPU）
 "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/train.py \
     --stage vae \
     --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
     --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
     --out_dir    ./runs/polygen_v1 --epochs 300
 
-# Stage 2: Latent DiT
+# Stage 1: Structural VAE（マルチ GPU: torchrun）
+torchrun --nproc_per_node=4 scripts/train.py \
+    --stage vae \
+    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
+    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+    --out_dir    ./runs/polygen_v1 --epochs 300
+
+# Stage 2: Latent DiT（シングル GPU）
 "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/train.py \
     --stage dit \
     --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
     --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
     --out_dir    ./runs/polygen_v1 --epochs 600 \
+    --vae_checkpoint ./runs/polygen_v1/vae_best.pt
+
+# Stage 2: Latent DiT（マルチノード: 2ノード × 4GPU の例）
+# node0 (MASTER_ADDR をここの IP に設定)
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 \
+    --master_addr=<node0_ip> --master_port=29500 \
+    scripts/train.py --stage dit \
+    --train_lmdb ... --val_lmdb ... --out_dir ... \
     --vae_checkpoint ./runs/polygen_v1/vae_best.pt
 ```
 
@@ -163,3 +178,13 @@ SMILES → ConditionalEncoder → h_cond, e_cond, Ci
 - RWPE は scipy.sparse で計算（scipy は polygen env に含まれる）
 - DiT は block-diagonal attention mask で分子間 cross-attention を遮断
 - VAE Decoder の初期座標は `init_pos MLP` で生成（全ゼロ禁止: EGNN の d²=0 問題）
+
+## 分散学習（DDP）
+
+- `torchrun` が `LOCAL_RANK` / `RANK` / `WORLD_SIZE` を自動設定 → `init_dist()` で検出
+- 学習モデルのみ DDP ラップ: VAE stage は cond_encoder + vae、DiT stage は flow のみ
+- 凍結モデル（DiT stage の cond_encoder / vae）は DDP 不要
+- チェックポイント保存・ログ出力は rank 0 のみ（`is_main_process()` ガード）
+- state_dict 保存時は `_unwrap(model).state_dict()` で DDP ラップを外す
+- val loss は `_all_reduce_dict()` でランク間集計してからグローバル平均を返す
+- 各 epoch 開始時に `train_sampler.set_epoch(epoch)` を呼ぶ（shuffle 再シード）

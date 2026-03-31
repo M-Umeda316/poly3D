@@ -4,21 +4,31 @@ PolyGen 学習スクリプト（2段階）
 Stage 1: Structural VAE (ConditionalEncoder + VAE)
 Stage 2: Latent DiT (Flow Matching)
 
-実行例:
-  # Stage 1
-  "C:/Users/shanu/anaconda3/envs/polygen/python.exe" train.py \\
-      --stage vae \\
-      --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \\
-      --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \\
+【シングル GPU】
+  "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/train.py \
+      --stage vae \
+      --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
+      --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
       --out_dir    ./runs/polygen_v1 --epochs 300
 
-  # Stage 2
-  "C:/Users/shanu/anaconda3/envs/polygen/python.exe" train.py \\
-      --stage dit \\
-      --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \\
-      --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \\
-      --out_dir    ./runs/polygen_v1 --epochs 600 \\
-      --vae_checkpoint ./runs/polygen_v1/vae_best.pt
+【マルチ GPU（単一ノード、4GPU の例）】
+  torchrun --nproc_per_node=4 scripts/train.py \
+      --stage vae \
+      --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
+      --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+      --out_dir    ./runs/polygen_v1 --epochs 300
+
+【マルチノード（2ノード × 4GPU = 8GPU の例）】
+  # node0 (master)
+  torchrun \
+      --nproc_per_node=4 --nnodes=2 --node_rank=0 \
+      --master_addr=<node0_ip> --master_port=29500 \
+      scripts/train.py --stage vae ...
+  # node1
+  torchrun \
+      --nproc_per_node=4 --nnodes=2 --node_rank=1 \
+      --master_addr=<node0_ip> --master_port=29500 \
+      scripts/train.py --stage vae ...
 """
 from __future__ import annotations
 
@@ -29,9 +39,12 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from poly3d.data.dataset import make_dataloader
@@ -42,6 +55,63 @@ from poly3d.model.flow_matching import FlowMatching
 from poly3d.model.vae_loss import vae_loss
 from poly3d.model.geo_losses import build_angle_triplets, build_dihedral_quartets
 
+
+# ── 分散学習ユーティリティ ─────────────────────────────────────────────────────
+
+def init_dist() -> tuple[int, int, int]:
+    """
+    torchrun が設定する環境変数から rank 情報を読み取り、
+    NCCL プロセスグループを初期化する。
+
+    Returns:
+        (local_rank, global_rank, world_size)
+        分散モードでない場合は (0, 0, 1)
+    """
+    local_rank = int(os.environ.get('LOCAL_RANK', -1))
+    if local_rank < 0:
+        return 0, 0, 1  # シングル GPU / CPU
+
+    dist.init_process_group(backend='nccl')
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(local_rank)
+    return local_rank, global_rank, world_size
+
+
+def cleanup_dist() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process() -> bool:
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    """DDP ラップを外して元のモジュールを返す。"""
+    return model.module if isinstance(model, DDP) else model
+
+
+def _all_reduce_dict(d: dict[str, float], n: int, device: torch.device) -> tuple[dict[str, float], int]:
+    """
+    各ランクの (sums_dict, n_batches) を全ランクで集計し、
+    グローバル平均を返す。分散モードでなければ入力をそのまま返す。
+    """
+    if not dist.is_initialized():
+        return d, n
+
+    keys = sorted(d.keys())
+    # キーごとの sum + n を 1 テンソルにまとめて 1 回 all_reduce
+    vals = torch.tensor([d[k] for k in keys] + [float(n)], device=device)
+    dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+    total_n = int(vals[-1].item())
+    result = {k: vals[i].item() for i, k in enumerate(keys)}
+    return result, total_n
+
+
+# ── 引数解析 ──────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -99,6 +169,8 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# ── モデル生成ファクトリ ────────────────────────────────────────────────────────
+
 def build_cond_encoder(args: argparse.Namespace) -> ConditionalEncoder:
     return ConditionalEncoder(
         hidden_dim=args.hidden_dim,
@@ -138,26 +210,46 @@ def build_dit(args: argparse.Namespace) -> LatentDiT:
 # ── VAE Trainer ────────────────────────────────────────────────────────────────
 
 class VAETrainer:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, local_rank: int):
         self.args = args
+        self.local_rank = local_rank
         self.out_dir = Path(args.out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.device = _get_device(args.device)
-        torch.manual_seed(args.seed)
+        if is_main_process():
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.device = _resolve_device(args.device, local_rank)
+        torch.manual_seed(args.seed + (dist.get_rank() if dist.is_initialized() else 0))
 
         self.cond_encoder = build_cond_encoder(args).to(self.device)
         self.vae = build_vae(args).to(self.device)
 
-        params = list(self.cond_encoder.parameters()) + list(self.vae.parameters())
+        # DDP ラップ（分散モード時のみ）
+        if dist.is_initialized():
+            self.cond_encoder = DDP(self.cond_encoder, device_ids=[local_rank])
+            self.vae = DDP(self.vae, device_ids=[local_rank])
+
+        params = (list(self.cond_encoder.parameters())
+                  + list(self.vae.parameters()))
         n_params = sum(p.numel() for p in params if p.requires_grad)
-        print(f'VAE パラメータ数: {n_params:,}')
+        if is_main_process():
+            print(f'VAE パラメータ数: {n_params:,}')
 
         self.optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=args.epochs)
 
+        # DistributedSampler（分散モード時はシャッフルをサンプラーに委譲）
+        self.train_sampler: Optional[DistributedSampler] = None
+        if dist.is_initialized():
+            from poly3d.data.dataset import ConformerDataset
+            _ds = ConformerDataset(args.train_lmdb, max_atoms=args.max_atoms)
+            self.train_sampler = DistributedSampler(
+                _ds, shuffle=True, seed=args.seed,
+            )
+
         self.train_loader = make_dataloader(
-            args.train_lmdb, batch_size=args.batch_size, shuffle=True,
+            args.train_lmdb, batch_size=args.batch_size,
+            shuffle=(self.train_sampler is None),
             num_workers=args.num_workers, max_atoms=args.max_atoms,
+            sampler=self.train_sampler,
         )
         self.val_loader = make_dataloader(
             args.val_lmdb, batch_size=args.batch_size, shuffle=False,
@@ -178,19 +270,22 @@ class VAETrainer:
 
     def _load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.cond_encoder.load_state_dict(ckpt['cond_encoder'])
-        self.vae.load_state_dict(ckpt['vae'])
+        _unwrap(self.cond_encoder).load_state_dict(ckpt['cond_encoder'])
+        _unwrap(self.vae).load_state_dict(ckpt['vae'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
         self.start_epoch = ckpt['epoch'] + 1
         self.best_val_loss = ckpt.get('val_loss', float('inf'))
-        print(f'Resume: {path} (epoch {ckpt["epoch"]})')
+        if is_main_process():
+            print(f'Resume: {path} (epoch {ckpt["epoch"]})')
 
     def _save(self, epoch: int, val_loss: float):
+        if not is_main_process():
+            return
         ckpt = {
             'epoch': epoch,
-            'cond_encoder': self.cond_encoder.state_dict(),
-            'vae': self.vae.state_dict(),
+            'cond_encoder': _unwrap(self.cond_encoder).state_dict(),
+            'vae': _unwrap(self.vae).state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'val_loss': val_loss,
@@ -208,7 +303,8 @@ class VAETrainer:
         sums: dict = {}
         n = 0
 
-        pbar = tqdm(loader, desc='Train' if train else 'Val', leave=False, dynamic_ncols=True)
+        pbar = tqdm(loader, desc='Train' if train else 'Val',
+                    leave=False, dynamic_ncols=True, disable=not is_main_process())
         for batch in pbar:
             if batch is None:
                 continue
@@ -226,9 +322,6 @@ class VAETrainer:
                     cond, batch.pos, batch.edge_index, e_cond, batch.batch
                 )
 
-                # グラフトポロジーはバッチ内全ノードで edge_index を共有
-                # triplets/quartets は各分子ごとに計算するとコストが高いので
-                # バッチレベルで一括計算（結果はバッチ全体の loss に使う）
                 num_nodes = batch.pos.size(0)
                 loss, ld = vae_loss(
                     pos_pred, batch.pos, mu, logvar,
@@ -244,59 +337,69 @@ class VAETrainer:
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(
-                    list(self.cond_encoder.parameters()) + list(self.vae.parameters()),
-                    self.args.grad_clip
+                    list(self.cond_encoder.parameters())
+                    + list(self.vae.parameters()),
+                    self.args.grad_clip,
                 )
                 self.optimizer.step()
 
             for k, v in ld.items():
                 sums[k] = sums.get(k, 0.0) + v
             n += 1
-            pbar.set_postfix({k: f'{v:.4f}' for k, v in ld.items()})
+            if is_main_process():
+                pbar.set_postfix({k: f'{v:.4f}' for k, v in ld.items()})
 
+        # 全ランクの sums / n を集計してグローバル平均を返す
+        sums, n = _all_reduce_dict(sums, n, self.device)
         return {k: v / max(n, 1) for k, v in sums.items()}
 
     def run(self):
         log = self.out_dir / 'vae_log.csv'
-        if self.start_epoch == 1:
+        if is_main_process() and self.start_epoch == 1:
             with open(log, 'w') as f:
                 f.write('epoch,beta,train_total,val_total,val_pos,val_kl,lr,elapsed\n')
 
         for epoch in range(self.start_epoch, self.args.epochs + 1):
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(epoch)
+
             beta = self._get_beta(epoch)
             t0 = time.time()
             tr = self._run_epoch(self.train_loader, True, beta)
             va = self._run_epoch(self.val_loader, False, beta)
             self.scheduler.step()
 
-            elapsed = time.time() - t0
-            lr = self.optimizer.param_groups[0]['lr']
-            print(
-                f'[VAE] Epoch {epoch:4d}/{self.args.epochs} β={beta:.3f} | '
-                f'train={tr["total"]:.4f} | val={va["total"]:.4f} '
-                f'(pos={va.get("pos",0):.4f} kl={va.get("kl",0):.4f}) | '
-                f'lr={lr:.2e} | {elapsed:.1f}s'
-            )
-            with open(log, 'a') as f:
-                f.write(f'{epoch},{beta:.4f},{tr.get("total",0):.6f},'
-                        f'{va.get("total",0):.6f},{va.get("pos",0):.6f},'
-                        f'{va.get("kl",0):.6f},{lr:.2e},{elapsed:.1f}\n')
+            if is_main_process():
+                elapsed = time.time() - t0
+                lr = self.optimizer.param_groups[0]['lr']
+                print(
+                    f'[VAE] Epoch {epoch:4d}/{self.args.epochs} β={beta:.3f} | '
+                    f'train={tr["total"]:.4f} | val={va["total"]:.4f} '
+                    f'(pos={va.get("pos",0):.4f} kl={va.get("kl",0):.4f}) | '
+                    f'lr={lr:.2e} | {elapsed:.1f}s'
+                )
+                with open(log, 'a') as f:
+                    f.write(f'{epoch},{beta:.4f},{tr.get("total",0):.6f},'
+                            f'{va.get("total",0):.6f},{va.get("pos",0):.6f},'
+                            f'{va.get("kl",0):.6f},{lr:.2e},{elapsed:.1f}\n')
 
-            if epoch % self.args.save_every == 0 or epoch == self.args.epochs:
-                self._save(epoch, va['total'])
+                if epoch % self.args.save_every == 0 or epoch == self.args.epochs:
+                    self._save(epoch, va['total'])
 
 
 # ── DiT Trainer ────────────────────────────────────────────────────────────────
 
 class DiTTrainer:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, local_rank: int):
         self.args = args
+        self.local_rank = local_rank
         self.out_dir = Path(args.out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.device = _get_device(args.device)
-        torch.manual_seed(args.seed)
+        if is_main_process():
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.device = _resolve_device(args.device, local_rank)
+        torch.manual_seed(args.seed + (dist.get_rank() if dist.is_initialized() else 0))
 
-        # ConditionalEncoder + VAE Encoder を凍結ロード
+        # ConditionalEncoder + VAE Encoder を凍結ロード（DDP 不要）
         if args.vae_checkpoint is None:
             raise ValueError('--vae_checkpoint を指定してください')
         vae_ckpt = torch.load(args.vae_checkpoint, map_location=self.device, weights_only=False)
@@ -314,15 +417,31 @@ class DiTTrainer:
         dit = build_dit(args)
         self.flow = FlowMatching(dit, t_max=args.t_max, p_selfcond=args.p_selfcond).to(self.device)
 
-        n_params = sum(p.numel() for p in dit.parameters() if p.requires_grad)
-        print(f'DiT パラメータ数: {n_params:,}')
+        # DDP ラップ（分散モード時のみ）
+        if dist.is_initialized():
+            self.flow = DDP(self.flow, device_ids=[local_rank])
 
-        self.optimizer = AdamW(dit.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        n_params = sum(p.numel() for p in self.flow.parameters() if p.requires_grad)
+        if is_main_process():
+            print(f'DiT パラメータ数: {n_params:,}')
+
+        self.optimizer = AdamW(self.flow.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=args.epochs)
 
+        # DistributedSampler
+        self.train_sampler: Optional[DistributedSampler] = None
+        if dist.is_initialized():
+            from poly3d.data.dataset import ConformerDataset
+            _ds = ConformerDataset(args.train_lmdb, max_atoms=args.max_atoms)
+            self.train_sampler = DistributedSampler(
+                _ds, shuffle=True, seed=args.seed,
+            )
+
         self.train_loader = make_dataloader(
-            args.train_lmdb, batch_size=args.batch_size, shuffle=True,
+            args.train_lmdb, batch_size=args.batch_size,
+            shuffle=(self.train_sampler is None),
             num_workers=args.num_workers, max_atoms=args.max_atoms,
+            sampler=self.train_sampler,
         )
         self.val_loader = make_dataloader(
             args.val_lmdb, batch_size=args.batch_size, shuffle=False,
@@ -336,17 +455,20 @@ class DiTTrainer:
 
     def _load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.flow.load_state_dict(ckpt['flow'])
+        _unwrap(self.flow).load_state_dict(ckpt['flow'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
         self.start_epoch = ckpt['epoch'] + 1
         self.best_val_loss = ckpt.get('val_loss', float('inf'))
-        print(f'Resume DiT: {path} (epoch {ckpt["epoch"]})')
+        if is_main_process():
+            print(f'Resume DiT: {path} (epoch {ckpt["epoch"]})')
 
     def _save(self, epoch: int, val_loss: float):
+        if not is_main_process():
+            return
         ckpt = {
             'epoch': epoch,
-            'flow': self.flow.state_dict(),
+            'flow': _unwrap(self.flow).state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'val_loss': val_loss,
@@ -363,7 +485,8 @@ class DiTTrainer:
         sums: dict = {}
         n = 0
 
-        pbar = tqdm(loader, desc='Train' if train else 'Val', leave=False, dynamic_ncols=True)
+        pbar = tqdm(loader, desc='Train' if train else 'Val',
+                    leave=False, dynamic_ncols=True, disable=not is_main_process())
         for batch in pbar:
             if batch is None:
                 continue
@@ -397,50 +520,70 @@ class DiTTrainer:
             for k, v in ld.items():
                 sums[k] = sums.get(k, 0.0) + v
             n += 1
-            pbar.set_postfix({k: f'{v:.4f}' for k, v in ld.items()})
+            if is_main_process():
+                pbar.set_postfix({k: f'{v:.4f}' for k, v in ld.items()})
 
+        sums, n = _all_reduce_dict(sums, n, self.device)
         return {k: v / max(n, 1) for k, v in sums.items()}
 
     def run(self):
         log = self.out_dir / 'dit_log.csv'
-        if self.start_epoch == 1:
+        if is_main_process() and self.start_epoch == 1:
             with open(log, 'w') as f:
                 f.write('epoch,train_flow,val_flow,lr,elapsed\n')
 
         for epoch in range(self.start_epoch, self.args.epochs + 1):
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(epoch)
+
             t0 = time.time()
             tr = self._run_epoch(self.train_loader, True)
             va = self._run_epoch(self.val_loader, False)
             self.scheduler.step()
 
-            elapsed = time.time() - t0
-            lr = self.optimizer.param_groups[0]['lr']
-            print(
-                f'[DiT] Epoch {epoch:4d}/{self.args.epochs} | '
-                f'train={tr["flow"]:.4f} | val={va["flow"]:.4f} | '
-                f'lr={lr:.2e} | {elapsed:.1f}s'
-            )
-            with open(log, 'a') as f:
-                f.write(f'{epoch},{tr.get("flow",0):.6f},{va.get("flow",0):.6f},'
-                        f'{lr:.2e},{elapsed:.1f}\n')
+            if is_main_process():
+                elapsed = time.time() - t0
+                lr = self.optimizer.param_groups[0]['lr']
+                print(
+                    f'[DiT] Epoch {epoch:4d}/{self.args.epochs} | '
+                    f'train={tr["flow"]:.4f} | val={va["flow"]:.4f} | '
+                    f'lr={lr:.2e} | {elapsed:.1f}s'
+                )
+                with open(log, 'a') as f:
+                    f.write(f'{epoch},{tr.get("flow",0):.6f},{va.get("flow",0):.6f},'
+                            f'{lr:.2e},{elapsed:.1f}\n')
 
-            if epoch % self.args.save_every == 0 or epoch == self.args.epochs:
-                self._save(epoch, va['flow'])
+                if epoch % self.args.save_every == 0 or epoch == self.args.epochs:
+                    self._save(epoch, va['flow'])
 
 
 # ── utils ───────────────────────────────────────────────────────────────────────
 
-def _get_device(device_str: str) -> torch.device:
+def _resolve_device(device_str: str, local_rank: int) -> torch.device:
+    """
+    分散モード時は local_rank の GPU を使う。
+    シングルモード時は device_str（'auto' なら CUDA 自動検出）。
+    """
+    if dist.is_initialized():
+        return torch.device(f'cuda:{local_rank}')
     if device_str == 'auto':
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     return torch.device(device_str)
 
 
 if __name__ == '__main__':
+    local_rank, global_rank, world_size = init_dist()
     args = parse_args()
-    print(f'Device: {_get_device(args.device)}')
 
-    if args.stage == 'vae':
-        VAETrainer(args).run()
-    else:
-        DiTTrainer(args).run()
+    if is_main_process():
+        mode = f'{world_size} GPU(s)' if world_size > 1 else 'シングル GPU'
+        device = _resolve_device(args.device, local_rank)
+        print(f'Device: {device}  ({mode})')
+
+    try:
+        if args.stage == 'vae':
+            VAETrainer(args, local_rank).run()
+        else:
+            DiTTrainer(args, local_rank).run()
+    finally:
+        cleanup_dist()

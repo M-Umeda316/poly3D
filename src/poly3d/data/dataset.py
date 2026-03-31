@@ -120,12 +120,17 @@ def make_dataloader(
     num_workers: int = 4,
     max_atoms: Optional[int] = 300,
     pin_memory: bool = True,
+    sampler: Optional[torch.utils.data.Sampler] = None,
 ) -> torch.utils.data.DataLoader:
+    """
+    sampler を渡した場合（DistributedSampler 等）は shuffle=False に切り替わる。
+    """
     dataset = ConformerDataset(lmdb_path, max_atoms=max_atoms)
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=(shuffle if sampler is None else False),
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         worker_init_fn=worker_init_fn,

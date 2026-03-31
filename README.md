@@ -76,6 +76,8 @@ python -m poly3d.preprocess.build_dataset \
 
 ## 学習
 
+### シングル GPU
+
 ```bash
 # Stage 1: Structural VAE (300 epochs)
 python scripts/train.py \
@@ -94,6 +96,35 @@ python scripts/train.py \
     --vae_checkpoint ./runs/polygen_v1/vae_best.pt \
     --epochs 600
 ```
+
+### マルチ GPU（単一ノード）
+
+```bash
+torchrun --nproc_per_node=4 scripts/train.py --stage vae \
+    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
+    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+    --out_dir    ./runs/polygen_v1 --epochs 300
+```
+
+### マルチノード（例: 2ノード × 4GPU = 8GPU）
+
+```bash
+# node0（マスター: IP=192.168.1.10）
+torchrun \
+    --nproc_per_node=4 --nnodes=2 --node_rank=0 \
+    --master_addr=192.168.1.10 --master_port=29500 \
+    scripts/train.py --stage vae \
+    --train_lmdb ... --val_lmdb ... --out_dir ./runs/polygen_v1 --epochs 300
+
+# node1
+torchrun \
+    --nproc_per_node=4 --nnodes=2 --node_rank=1 \
+    --master_addr=192.168.1.10 --master_port=29500 \
+    scripts/train.py --stage vae \
+    --train_lmdb ... --val_lmdb ... --out_dir ./runs/polygen_v1 --epochs 300
+```
+
+`--batch_size` はランクごとのバッチサイズ。実効 batch = `batch_size × world_size`。
 
 主なオプション（`python scripts/train.py --help` で全一覧）:
 
