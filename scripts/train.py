@@ -192,6 +192,8 @@ def parse_args() -> argparse.Namespace:
                    help='torch.compile でモデルをコンパイル（PyTorch 2.0+）')
     p.add_argument('--benchmark', type=int, default=0, metavar='N',
                    help='N バッチでベンチマークを実行して終了。セクション別タイミングを出力')
+    p.add_argument('--tb_log_every', type=int, default=100,
+                   help='TensorBoard に途中経過を書き込むステップ間隔（0 = エポック末のみ）')
 
     return p.parse_args()
 
@@ -300,6 +302,7 @@ class VAETrainer:
 
         self.start_epoch = 1
         self.best_val_loss = float('inf')
+        self.global_step = 0
         if args.resume:
             self._load(args.resume)
 
@@ -351,6 +354,7 @@ class VAETrainer:
         n = 0   # 処理済みバッチ数
         n_batches = len(loader)
         accum = self.args.grad_accum
+        tb_every = self.args.tb_log_every
 
         if train:
             self.optimizer.zero_grad(set_to_none=True)
@@ -412,6 +416,16 @@ class VAETrainer:
             if is_main_process():
                 pbar.set_postfix({k: f'{sums[k]/n:.4f}' for k in sums})
 
+            # TensorBoard 途中経過（train のみ）
+            if train and is_main_process() and tb_every > 0 and n % tb_every == 0:
+                self.global_step += tb_every
+                if self.writer is not None:
+                    for k in sums:
+                        self.writer.add_scalar(
+                            f'Step/train_{k}', sums[k] / n, self.global_step
+                        )
+                    self.writer.flush()
+
         # 全ランクの sums / n を集計してグローバル平均を返す
         sums, n = _all_reduce_dict(sums, n, self.device)
         return {k: v / max(n, 1) for k, v in sums.items()}
@@ -437,10 +451,12 @@ class VAETrainer:
             if is_main_process():
                 elapsed = time.time() - t0
                 lr = self.optimizer.param_groups[0]['lr']
+                val_str = (f'{va["total"]:.4f} '
+                           f'(pos={va.get("pos",0):.4f} kl={va.get("kl",0):.4f})'
+                           if run_val else '(skip)')
                 print(
                     f'[VAE] Epoch {epoch:4d}/{self.args.epochs} β={beta:.3f} | '
-                    f'train={tr["total"]:.4f} | val={va["total"]:.4f} '
-                    f'(pos={va.get("pos",0):.4f} kl={va.get("kl",0):.4f}) | '
+                    f'train={tr["total"]:.4f} | val={val_str} | '
                     f'lr={lr:.2e} | {elapsed:.1f}s'
                 )
 
@@ -453,12 +469,14 @@ class VAETrainer:
                 # TensorBoard
                 if self.writer is not None:
                     self.writer.add_scalar('Loss/train_total', tr.get('total', 0), epoch)
-                    self.writer.add_scalar('Loss/val_total', va.get('total', 0), epoch)
-                    for key in ('pos', 'bond', 'angle', 'dihedral', 'kl'):
-                        if key in va:
-                            self.writer.add_scalar(f'Loss/val_{key}', va[key], epoch)
+                    if run_val:
+                        self.writer.add_scalar('Loss/val_total', va.get('total', 0), epoch)
+                        for key in ('pos', 'bond', 'angle', 'dihedral', 'kl'):
+                            if key in va:
+                                self.writer.add_scalar(f'Loss/val_{key}', va[key], epoch)
                     self.writer.add_scalar('Params/lr', lr, epoch)
                     self.writer.add_scalar('Params/beta', beta, epoch)
+                    self.writer.flush()   # エポックごとにディスクへ書き込み
 
                 if (epoch % self.args.save_every == 0 or epoch == self.args.epochs) and run_val:
                     self._save(epoch, va['total'])
@@ -573,6 +591,7 @@ class DiTTrainer:
 
         self.start_epoch = 1
         self.best_val_loss = float('inf')
+        self.global_step = 0
         if args.resume:
             self._load(args.resume)
 
@@ -615,6 +634,7 @@ class DiTTrainer:
         n = 0
         n_batches = len(loader)
         accum = self.args.grad_accum
+        tb_every = self.args.tb_log_every
 
         if train:
             self.optimizer.zero_grad(set_to_none=True)
@@ -676,6 +696,16 @@ class DiTTrainer:
             if is_main_process():
                 pbar.set_postfix({k: f'{sums[k]/n:.4f}' for k in sums})
 
+            # TensorBoard 途中経過（train のみ）
+            if train and is_main_process() and tb_every > 0 and n % tb_every == 0:
+                self.global_step += tb_every
+                if self.writer is not None:
+                    for k in sums:
+                        self.writer.add_scalar(
+                            f'Step/train_{k}', sums[k] / n, self.global_step
+                        )
+                    self.writer.flush()
+
         sums, n = _all_reduce_dict(sums, n, self.device)
         return {k: v / max(n, 1) for k, v in sums.items()}
 
@@ -717,6 +747,7 @@ class DiTTrainer:
                     if run_val:
                         self.writer.add_scalar('Loss/val_flow', va.get('flow', 0), epoch)
                     self.writer.add_scalar('Params/lr', lr, epoch)
+                    self.writer.flush()   # エポックごとにディスクへ書き込み
 
                 if (epoch % self.args.save_every == 0 or epoch == self.args.epochs) and run_val:
                     self._save(epoch, va['flow'])
