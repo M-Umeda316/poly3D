@@ -242,6 +242,7 @@ class LatentDiT(nn.Module):
         edge_index: Optional[Tensor],
         batch: Tensor,
         num_nodes: int,
+        dist_mat: Optional[Tensor] = None,
     ) -> Tensor:
         """
         グラフ距離 BFS とブロック対角マスクを 1 回計算し、
@@ -250,17 +251,30 @@ class LatentDiT(nn.Module):
           同分子内  : pos_bias 値 (use_pos_bias=False なら 0)
           異分子間  : -1e9  (softmax で実質ゼロ → cross-molecule attention を遮断)
 
-        BFS は純 Python であり計算コストが高い。
-        FlowMatching.loss() / sample() から 1 バッチにつき 1 回だけ呼ぶこと。
+        Parameters
+        ----------
+        dist_mat : (total_N, total_N) int8 optional
+            DataLoader ワーカーで事前計算済みのブロック対角距離行列。
+            提供された場合は BFS をスキップして高速パスを使用。
+            None の場合はオンザフライで BFS 計算（低速パス）。
         """
         device = batch.device
         attn_mask = _build_block_diagonal_mask(batch)   # (N, N) bool
 
-        if self.pos_bias is not None and edge_index is not None:
-            pos_bias_val = _build_batch_pos_bias(
-                edge_index, batch, num_nodes, self.pos_bias
-            )                                            # (N, N, H)
-            combined = pos_bias_val.permute(2, 0, 1).contiguous()   # (H, N, N)
+        if self.pos_bias is not None:
+            if dist_mat is not None:
+                # 高速パス: ワーカーで事前計算済みの距離行列を使用（BFS スキップ）
+                oh = dist_to_onehot(dist_mat.long().to(device))       # (N, N, 5)
+                pos_bias_val = self.pos_bias(oh)                       # (N, N, H)
+                combined = pos_bias_val.permute(2, 0, 1).contiguous() # (H, N, N)
+            elif edge_index is not None:
+                # 低速パス: オンザフライ BFS（dist_mat 未提供時の後方互換）
+                pos_bias_val = _build_batch_pos_bias(
+                    edge_index, batch, num_nodes, self.pos_bias
+                )                                                       # (N, N, H)
+                combined = pos_bias_val.permute(2, 0, 1).contiguous()  # (H, N, N)
+            else:
+                combined = torch.zeros(self.n_heads, num_nodes, num_nodes, device=device)
         else:
             combined = torch.zeros(self.n_heads, num_nodes, num_nodes, device=device)
 
@@ -296,7 +310,7 @@ class LatentDiT(nn.Module):
 
         # attn_bias が未提供なら内部で計算（backward compat）
         if attn_bias is None:
-            attn_bias = self.precompute_attn_inputs(edge_index, batch, N)
+            attn_bias = self.precompute_attn_inputs(edge_index, batch, N, dist_mat=None)
 
         # Transformer
         for block in self.blocks:

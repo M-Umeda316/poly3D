@@ -13,10 +13,12 @@ Flow Matching スケジューラ + 損失
   Zt-dt = Zt - dt * (Zt - Z1_pred) / (1 - t)
 
 パフォーマンスメモ:
-  attn_bias (グラフ距離 BFS) は loss() / sample() の先頭で 1 回だけ計算し、
+  attn_bias（グラフ距離 BFS）は loss() / sample() の先頭で 1 回だけ計算し、
   複数の forward 呼び出しに使い回す。
     - loss(): self-cond 2 パス → 1 回の BFS に削減
     - sample(): n_steps ステップ → 1 回の BFS に削減
+
+  dist_mat（DataLoader ワーカーで事前計算済み）を渡すと BFS を完全にスキップ。
 """
 from __future__ import annotations
 
@@ -59,15 +61,21 @@ class FlowMatching(nn.Module):
         z0: Tensor,          # (N, latent_dim)  VAE encoder 出力 (mu)
         cond: Tensor,        # (N, cond_dim)    ConditionalEncoder Ci
         batch: Tensor,       # (N,) int
-        edge_index: Optional[Tensor] = None,  # (2, E)
+        edge_index: Optional[Tensor] = None,   # (2, E)
+        dist_mat: Optional[Tensor] = None,     # (N, N) int8 — ワーカー事前計算
     ) -> Tuple[Tensor, dict]:
         """
+        Parameters
+        ----------
+        dist_mat : DataLoader ワーカーで事前計算済みのブロック対角グラフ距離行列。
+                   提供されると BFS を完全にスキップして高速化。
+
         Returns
         -------
         loss     : scalar
         loss_dict: {'flow': float}
         """
-        B = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
+        B = (batch[-1] + 1) if batch.numel() > 0 else 1
         N = z0.size(0)
         device = z0.device
 
@@ -83,7 +91,7 @@ class FlowMatching(nn.Module):
 
         # BFS・マスク計算を 1 回だけ実行（DDP 外のローカルモジュールで計算）
         raw = _unwrap_model(self.model)
-        attn_bias = raw.precompute_attn_inputs(edge_index, batch, N)
+        attn_bias = raw.precompute_attn_inputs(edge_index, batch, N, dist_mat=dist_mat)
 
         # Self-conditioning: no_grad パス
         # DDP を介さず raw module を直接呼ぶことで不要な gradient sync を回避
@@ -100,7 +108,7 @@ class FlowMatching(nn.Module):
         weight = 1.0 / (1.0 - t_node).pow(2).clamp(min=1e-4)
         flow_loss = (weight * (z1 - z1_pred).pow(2).mean(dim=-1)).mean()
 
-        return flow_loss, {'flow': flow_loss.item()}
+        return flow_loss, {'flow': flow_loss.detach()}
 
     @torch.no_grad()
     def sample(
@@ -111,24 +119,26 @@ class FlowMatching(nn.Module):
         n_steps: int = 100,
         edge_index: Optional[Tensor] = None,
         device: Optional[torch.device] = None,
+        dist_mat: Optional[Tensor] = None,     # (N, N) int8 — ワーカー事前計算
     ) -> Tensor:
         """
         Euler ODE サンプリング。Z1 ~ N(0,I) → Z0。
 
         attn_bias（BFS）をループ外で 1 回だけ計算し、全ステップで使い回す。
         Self-conditioning: 前ステップの z1_pred を次ステップの z_sc に渡す。
+        dist_mat が提供された場合は BFS を完全にスキップ。
         """
         if device is None:
             device = cond.device
 
-        B = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
+        B = (batch[-1] + 1) if batch.numel() > 0 else 1
         raw = _unwrap_model(self.model)
         latent_dim = raw.latent_dim
 
         zt = torch.randn(n_atoms, latent_dim, device=device)
 
         # BFS は ODE ループ外で 1 回だけ
-        attn_bias = raw.precompute_attn_inputs(edge_index, batch, n_atoms)
+        attn_bias = raw.precompute_attn_inputs(edge_index, batch, n_atoms, dist_mat=dist_mat)
 
         # t: 1.0 → 0.0
         ts = torch.linspace(1.0, 0.0, n_steps + 1, device=device)

@@ -60,11 +60,16 @@ cd C:/Users/shanu/Documents/Python/poly3D
 
 ```bash
 # Stage 1: Structural VAE（シングル GPU）
+# RTX4060Ti 16GB / Ryzen9 7900X 推奨設定
 "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/train.py \
     --stage vae \
     --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
     --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
-    --out_dir    ./runs/polygen_v1 --epochs 300
+    --out_dir    ./runs/polygen_v1 --epochs 300 \
+    --batch_size 64 --num_workers 8 --grad_accum 2
+
+# RTX5000 Ada 32GB / Xeon 8558 推奨設定
+# --batch_size 128 --num_workers 16 --grad_accum 2
 
 # Stage 1: Structural VAE（マルチ GPU: torchrun）
 torchrun --nproc_per_node=4 scripts/train.py \

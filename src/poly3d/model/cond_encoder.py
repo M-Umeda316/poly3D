@@ -218,7 +218,9 @@ class ConditionalEncoder(nn.Module):
         # ── Global pooling → Ci ────────────────────────────────────────────
         if batch is None:
             batch = torch.zeros(h.size(0), dtype=torch.long, device=h.device)
-        g = scatter(h, batch, dim=0, dim_size=batch.max().item() + 1, reduce='sum')  # (B, hidden_dim)
+        # num_graphs: batch index から GPU-CPU sync なしで推定
+        num_graphs = batch[-1] + 1 if batch.numel() > 0 else 1
+        g = scatter(h, batch, dim=0, dim_size=num_graphs, reduce='sum')  # (B, hidden_dim)
         g_expand = g[batch]                  # (N, hidden_dim)
         cond = self.global_proj(torch.cat([h, g_expand], dim=-1))  # (N, hidden_dim)
 

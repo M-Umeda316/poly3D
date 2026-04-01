@@ -93,12 +93,14 @@ def vae_loss(
     if beta > 0.0:
         total = total + beta * l_kl
 
+    # detach のみ（.item() は呼ばない → GPU-CPU sync を回避）
+    # 呼び出し側で必要時に .item() を呼ぶ
     loss_dict = {
-        'total': total.item(),
-        'pos': l_pos.item(),
-        'bond': l_bond.item(),
-        'angle': l_angle.item(),
-        'dihedral': l_dihedral.item(),
-        'kl': l_kl.item(),
+        'total': total.detach(),
+        'pos': l_pos.detach(),
+        'bond': l_bond.detach(),
+        'angle': l_angle.detach(),
+        'dihedral': l_dihedral.detach(),
+        'kl': l_kl.detach(),
     }
     return total, loss_dict

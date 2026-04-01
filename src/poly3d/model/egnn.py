@@ -111,11 +111,10 @@ class EGNNLayer(nn.Module):
         )                                           # (N, 3)
 
         if self.norm_coord:
-            # 近傍数で割って更新量をスケーリング
-            n_neighbors = scatter(
-                torch.ones(src.size(0), device=src.device),
-                src, dim=0, dim_size=x.size(0), reduce='sum',
-            ).clamp(min=1.0).unsqueeze(-1)          # (N, 1)
+            # 近傍数で割って更新量をスケーリング（bincount で allocation 節約）
+            n_neighbors = torch.bincount(
+                src, minlength=x.size(0),
+            ).float().clamp(min=1.0).unsqueeze(-1)  # (N, 1)
             coord_delta = coord_delta / n_neighbors
 
         # scatter 後に再クランプ（diff * coord_w の積が大きい場合に備える）
