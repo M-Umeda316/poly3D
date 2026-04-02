@@ -19,6 +19,9 @@ from torch import Tensor
 from torch_scatter import scatter
 
 
+_DIST_SQ_MAX: float = 100.0   # d² クランプ上限（√100 = 10 Å 相当）
+
+
 def _silu() -> nn.SiLU:
     return nn.SiLU()
 
@@ -73,7 +76,8 @@ class EGNNLayer(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # ノード特徴量爆発を防ぐ LayerNorm
+        # エッジメッセージ・ノード特徴量爆発を防ぐ LayerNorm（bf16 対策）
+        self.edge_norm = nn.LayerNorm(hidden_dim)
         self.node_norm = nn.LayerNorm(hidden_dim)
 
         self._reset_parameters()
@@ -91,14 +95,20 @@ class EGNNLayer(nn.Module):
         edge_attr: Tensor,   # (E, edge_feat_dim)
         batch: Optional[Tensor] = None,  # (N,) バッチ割り当て（未使用だが API 統一用）
     ) -> Tuple[Tensor, Tensor]:
+        """
+        Returns
+        -------
+        h_new : (N, hidden_dim)  更新後ノード特徴量
+        x_new : (N, 3)           更新後座標（SE(3)-同変）
+        """
         src, dst = edge_index   # src→dst のエッジ
 
         # ─── エッジメッセージ ───
         diff = x[src] - x[dst]                     # (E, 3)
-        dist_sq = (diff.pow(2)).sum(dim=-1, keepdim=True).clamp(max=100.0)   # (E, 1)
+        dist_sq = (diff.pow(2)).sum(dim=-1, keepdim=True).clamp(max=_DIST_SQ_MAX)  # (E, 1)
 
         edge_in = torch.cat([h[src], h[dst], dist_sq, edge_attr], dim=-1)
-        m = self.edge_mlp(edge_in)                  # (E, hidden_dim)
+        m = self.edge_norm(self.edge_mlp(edge_in))  # (E, hidden_dim)
 
         # ─── 座標更新 ───
         coord_w = self.coord_mlp(m)                 # (E, 1)
@@ -169,6 +179,7 @@ class EGNN(nn.Module):
         super().__init__()
 
         self.input_proj = nn.Linear(in_node_dim, hidden_dim)
+        self.input_norm = nn.LayerNorm(hidden_dim)   # input_proj 後の bf16 オーバーフロー防止
 
         self.layers = nn.ModuleList([
             EGNNLayer(
@@ -183,14 +194,20 @@ class EGNN(nn.Module):
 
     def forward(
         self,
-        h0: Tensor,
-        x0: Tensor,
-        edge_index: Tensor,
-        edge_attr: Tensor,
-        batch: Optional[Tensor] = None,
+        h0: Tensor,          # (N, in_node_dim)
+        x0: Tensor,          # (N, 3)
+        edge_index: Tensor,  # (2, E)
+        edge_attr: Tensor,   # (E, edge_feat_dim)
+        batch: Optional[Tensor] = None,  # (N,)
     ) -> Tuple[Tensor, Tensor]:
-        h = self.input_proj(h0)   # (N, hidden_dim)
-        x = x0                    # (N, 3)
+        """
+        Returns
+        -------
+        h : (N, hidden_dim)  最終ノード特徴量
+        x : (N, 3)           更新後座標
+        """
+        h = self.input_norm(self.input_proj(h0))   # (N, hidden_dim)
+        x = x0                                    # (N, 3)
 
         for layer in self.layers:
             h, x = layer(h, x, edge_index, edge_attr, batch)

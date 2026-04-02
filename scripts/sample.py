@@ -25,9 +25,7 @@ import torch
 from rdkit import Chem
 from torch_geometric.data import Data
 
-from poly3d.model.cond_encoder import ConditionalEncoder
-from poly3d.model.vae import StructuralVAE
-from poly3d.model.dit import LatentDiT
+from poly3d.model.builder import build_cond_encoder, build_vae, build_dit
 from poly3d.model.flow_matching import FlowMatching
 from poly3d.model.features import smiles_to_data
 
@@ -52,27 +50,11 @@ def load_models(vae_path: str, dit_path: str, device: torch.device):
     vae_ckpt = torch.load(vae_path, map_location=device, weights_only=False)
     vae_args = argparse.Namespace(**vae_ckpt['args'])
 
-    cond_encoder = ConditionalEncoder(
-        hidden_dim=vae_args.hidden_dim,
-        edge_dim=vae_args.edge_dim,
-        n_layers=vae_args.cond_layers,
-        atom_emb_dim=vae_args.atom_emb_dim,
-        hyb_emb_dim=vae_args.hyb_emb_dim,
-        bond_emb_dim=vae_args.bond_emb_dim,
-        use_rwpe=vae_args.use_rwpe,
-        use_lappe=vae_args.use_lappe,
-    ).to(device)
+    cond_encoder = build_cond_encoder(vae_args).to(device)
     cond_encoder.load_state_dict(vae_ckpt['cond_encoder'])
     cond_encoder.eval()
 
-    vae = StructuralVAE(
-        cond_dim=vae_args.hidden_dim,
-        edge_dim=vae_args.edge_dim,
-        hidden_dim=vae_args.vae_hidden_dim,
-        latent_dim=vae_args.latent_dim,
-        enc_layers=vae_args.enc_layers,
-        dec_layers=vae_args.dec_layers,
-    ).to(device)
+    vae = build_vae(vae_args).to(device)
     vae.load_state_dict(vae_ckpt['vae'])
     vae.eval()
 
@@ -80,14 +62,7 @@ def load_models(vae_path: str, dit_path: str, device: torch.device):
     dit_ckpt = torch.load(dit_path, map_location=device, weights_only=False)
     dit_args = argparse.Namespace(**dit_ckpt['args'])
 
-    dit = LatentDiT(
-        latent_dim=vae_args.latent_dim,
-        cond_dim=vae_args.hidden_dim,
-        time_dim=dit_args.time_dim,
-        hidden_dim=dit_args.dit_hidden_dim,
-        n_heads=dit_args.dit_n_heads,
-        n_layers=dit_args.dit_n_layers,
-    ).to(device)
+    dit = build_dit(dit_args).to(device)
     # チェックポイントには LatentDiT の weights のみ保存されている
     dit.load_state_dict(dit_ckpt['flow'])
     flow = FlowMatching(dit, t_max=dit_args.t_max)

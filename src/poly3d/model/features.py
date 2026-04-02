@@ -9,9 +9,12 @@ RWPE (Random Walk Positional Encoding) と LapPE (Laplacian PE) の計算も担�
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from rdkit.Chem import Atom, Bond, Mol
 
 # ── 原子タイプ辞書 ────────────────────────────────────────────────────────────
 # インデックス 0〜15: known elements, 16: "other"
@@ -67,17 +70,17 @@ LAPPE_DIM = 8       # Laplacian PE の eigenvector 数
 
 # ── 原子・結合ごとの特徴量抽出 ─────────────────────────────────────────────────
 
-def atom_type_idx(atom) -> int:
+def atom_type_idx(atom: "Atom") -> int:
     """原子番号 → embedding インデックス。"""
     return _ATOM_Z_TO_IDX.get(atom.GetAtomicNum(), len(ATOM_TYPES))
 
 
-def hybridization_idx(atom) -> int:
+def hybridization_idx(atom: "Atom") -> int:
     """混成軌道 → embedding インデックス。"""
     return _HYB_TO_IDX.get(atom.GetHybridization(), len(HYBRIDIZATION_TYPES))
 
 
-def atom_cont_features(atom) -> List[float]:
+def atom_cont_features(atom: "Atom") -> List[float]:
     """原子の連続値特徴量（次元数 = ATOM_CONT_DIM）。"""
     return [
         float(atom.GetIsAromatic()),
@@ -88,7 +91,7 @@ def atom_cont_features(atom) -> List[float]:
     ]
 
 
-def bond_type_idx(bond) -> int:
+def bond_type_idx(bond: "Bond") -> int:
     """結合タイプ → embedding インデックス。"""
     from rdkit.Chem import rdchem
     bt = bond.GetBondType()
@@ -99,7 +102,7 @@ def bond_type_idx(bond) -> int:
     return 4
 
 
-def bond_cont_features(bond) -> List[float]:
+def bond_cont_features(bond: "Bond") -> List[float]:
     """結合の連続値特徴量（次元数 = BOND_CONT_DIM）。"""
     return [
         float(bond.GetIsConjugated()),
@@ -200,12 +203,12 @@ def compute_lappe(
 # ── mol → データ dict 変換 ─────────────────────────────────────────────────────
 
 def mol_to_data(
-    mol,
+    mol: "Mol",
     sid: str = '',
     center: bool = True,
     use_rwpe: bool = True,
     use_lappe: bool = False,
-) -> Dict:
+) -> Dict[str, Any]:
     """
     RDKit Mol → 学習用データ dict。
 
@@ -220,6 +223,7 @@ def mol_to_data(
         bond_type_idx  : np.int32  (2E,)  両方向
         bond_cont      : np.float32 (2E, BOND_CONT_DIM)
         edge_index     : np.int64  (2, 2E)
+        n_atoms        : int
         rwpe           : np.float32 (N, RWPE_DIM)   use_rwpe=True の場合
         lappe          : np.float32 (N, LAPPE_DIM)  use_lappe=True の場合
         pos            : np.float32 (N, 3)  重心ゼロ (center=True)
@@ -282,6 +286,8 @@ def mol_to_data(
         'sid': sid,
     }
 
+    data['n_atoms'] = n
+
     if use_rwpe:
         data['rwpe'] = compute_rwpe(edge_index, n)
     if use_lappe:
@@ -295,7 +301,7 @@ def smiles_to_data(
     add_h: bool = True,
     use_rwpe: bool = True,
     use_lappe: bool = False,
-) -> Dict:
+) -> Dict[str, Any]:
     """
     SMILES → 推論用グラフデータ（3D 座標なし）。
 

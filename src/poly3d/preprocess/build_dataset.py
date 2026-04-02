@@ -28,9 +28,12 @@ import lmdb
 import numpy as np
 from tqdm import tqdm
 
+# read_molecule() の戻り値型エイリアス: (atomic_nums, positions, charge, sid)
+MolRecord = Tuple[np.ndarray, np.ndarray, int, str]
+
 
 def _process_record(
-    args: Tuple[np.ndarray, np.ndarray, int, str],
+    args: MolRecord,
 ) -> Optional[bytes]:
     """
     1 分子を処理して pickle bytes を返す。失敗時は None。
@@ -131,27 +134,6 @@ class DatasetBuilder:
                 txn = env.begin(write=True)
             return txn
 
-        # ctx = mp.get_context('spawn')
-
-        # with ctx.Pool(processes=self.n_workers) as pool:
-        #     txn = env.begin(write=True)
-
-        #     for lmdb_file in tqdm(lmdb_files, desc='Files', unit='file'):
-        #         args_iter = (read_molecule(rec) for rec in iter_lmdb(lmdb_file))
-        #         results = pool.imap_unordered(_process_record, args_iter, chunksize=self.chunk_size)
-
-        #         for payload in results:
-        #             if payload is None:
-        #                 total_skip += 1
-        #                 continue
-        #             key = f'{total_ok:09d}'.encode('ascii')
-        #             txn.put(key, payload)
-        #             total_ok += 1
-        #             if total_ok % 10_000 == 0:
-        #                 txn.commit()
-        #                 txn = env.begin(write=True)
-
-        #     txn.commit()
         txn = env.begin(write=True)
 
         for lmdb_file in tqdm(lmdb_files, desc='Files', unit='file'):

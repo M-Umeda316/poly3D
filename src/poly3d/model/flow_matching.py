@@ -75,7 +75,7 @@ class FlowMatching(nn.Module):
         loss     : scalar
         loss_dict: {'flow': float}
         """
-        B = (batch[-1] + 1) if batch.numel() > 0 else 1
+        B = int(batch[-1]) + 1 if batch.numel() > 0 else 1
         N = z0.size(0)
         device = z0.device
 
@@ -131,7 +131,7 @@ class FlowMatching(nn.Module):
         if device is None:
             device = cond.device
 
-        B = (batch[-1] + 1) if batch.numel() > 0 else 1
+        B = int(batch[-1]) + 1 if batch.numel() > 0 else 1
         raw = _unwrap_model(self.model)
         latent_dim = raw.latent_dim
 

@@ -56,9 +56,7 @@ from tqdm import tqdm
 
 from poly3d.data.dataset import make_dataloader
 from poly3d.data.latent_dataset import make_latent_dataloader
-from poly3d.model.cond_encoder import ConditionalEncoder
-from poly3d.model.vae import StructuralVAE
-from poly3d.model.dit import LatentDiT
+from poly3d.model.builder import build_cond_encoder, build_vae, build_dit
 from poly3d.model.flow_matching import FlowMatching
 from poly3d.model.vae_loss import vae_loss
 
@@ -198,44 +196,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ── モデル生成ファクトリ ────────────────────────────────────────────────────────
-
-def build_cond_encoder(args: argparse.Namespace) -> ConditionalEncoder:
-    return ConditionalEncoder(
-        hidden_dim=args.hidden_dim,
-        edge_dim=args.edge_dim,
-        n_layers=args.cond_layers,
-        atom_emb_dim=args.atom_emb_dim,
-        hyb_emb_dim=args.hyb_emb_dim,
-        bond_emb_dim=args.bond_emb_dim,
-        use_rwpe=args.use_rwpe,
-        use_lappe=args.use_lappe,
-    )
-
-
-def build_vae(args: argparse.Namespace) -> StructuralVAE:
-    return StructuralVAE(
-        cond_dim=args.hidden_dim,
-        edge_dim=args.edge_dim,
-        hidden_dim=args.vae_hidden_dim,
-        latent_dim=args.latent_dim,
-        enc_layers=args.enc_layers,
-        dec_layers=args.dec_layers,
-    )
-
-
-def build_dit(args: argparse.Namespace) -> LatentDiT:
-    return LatentDiT(
-        latent_dim=args.latent_dim,
-        cond_dim=args.hidden_dim,
-        time_dim=args.time_dim,
-        hidden_dim=args.dit_hidden_dim,
-        n_heads=args.dit_n_heads,
-        n_layers=args.dit_n_layers,
-        use_pos_bias=args.use_pos_bias,
-    )
-
-
 # ── VAE Trainer ────────────────────────────────────────────────────────────────
 
 class VAETrainer:
@@ -347,7 +307,7 @@ class VAETrainer:
             torch.save(ckpt, self.out_dir / 'vae_best.pt')
             print(f'  → best 更新 (val_loss: {val_loss:.4f})')
 
-    def _run_epoch(self, loader, train: bool, beta: float) -> dict:
+    def _run_epoch(self, loader, train: bool, beta: float) -> dict[str, float]:
         self.cond_encoder.train(train)
         self.vae.train(train)
         sums: dict = {}
@@ -628,7 +588,7 @@ class DiTTrainer:
             torch.save(ckpt, self.out_dir / 'dit_best.pt')
             print(f'  → best 更新 (val_loss: {val_loss:.4f})')
 
-    def _run_epoch(self, loader, train: bool) -> dict:
+    def _run_epoch(self, loader, train: bool) -> dict[str, float]:
         self.flow.train(train)
         sums: dict = {}
         n = 0

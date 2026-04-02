@@ -33,8 +33,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from poly3d.data.dataset import make_dataloader
-from poly3d.model.cond_encoder import ConditionalEncoder
-from poly3d.model.vae import StructuralVAE
+from poly3d.model.builder import build_cond_encoder, build_vae
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,27 +65,11 @@ def main():
     ckpt = torch.load(args.vae_checkpoint, map_location=device, weights_only=False)
     vae_args = argparse.Namespace(**ckpt['args'])
 
-    cond_encoder = ConditionalEncoder(
-        hidden_dim=vae_args.hidden_dim,
-        edge_dim=vae_args.edge_dim,
-        n_layers=vae_args.cond_layers,
-        atom_emb_dim=vae_args.atom_emb_dim,
-        hyb_emb_dim=vae_args.hyb_emb_dim,
-        bond_emb_dim=vae_args.bond_emb_dim,
-        use_rwpe=vae_args.use_rwpe,
-        use_lappe=vae_args.use_lappe,
-    ).to(device)
+    cond_encoder = build_cond_encoder(vae_args).to(device)
     cond_encoder.load_state_dict(ckpt['cond_encoder'])
     cond_encoder.eval().requires_grad_(False)
 
-    vae = StructuralVAE(
-        cond_dim=vae_args.hidden_dim,
-        edge_dim=vae_args.edge_dim,
-        hidden_dim=vae_args.vae_hidden_dim,
-        latent_dim=vae_args.latent_dim,
-        enc_layers=vae_args.enc_layers,
-        dec_layers=vae_args.dec_layers,
-    ).to(device)
+    vae = build_vae(vae_args).to(device)
     vae.load_state_dict(ckpt['vae'])
     vae.eval().requires_grad_(False)
 

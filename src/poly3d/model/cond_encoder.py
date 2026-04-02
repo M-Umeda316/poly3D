@@ -70,6 +70,7 @@ class MPNNLayer(nn.Module):
             nn.Linear(edge_dim, edge_dim),
         )
 
+        self.msg_norm  = nn.LayerNorm(hidden_dim)   # msg_mlp 後の bf16 オーバーフロー防止
         self.node_norm = nn.LayerNorm(hidden_dim)
         self.edge_norm = nn.LayerNorm(edge_dim)
 
@@ -79,10 +80,16 @@ class MPNNLayer(nn.Module):
         e: Tensor,           # (E, edge_dim)
         edge_index: Tensor,  # (2, E)
     ) -> Tuple[Tensor, Tensor]:
+        """
+        Returns
+        -------
+        h_new : (N, hidden_dim)  更新後ノード特徴量
+        e_new : (E, edge_dim)    更新後エッジ特徴量
+        """
         src, dst = edge_index
 
-        # メッセージ
-        m = self.msg_mlp(torch.cat([h[src], h[dst], e], dim=-1))   # (E, hidden_dim)
+        # メッセージ（正規化で scatter 前の bf16 オーバーフローを防ぐ）
+        m = self.msg_norm(self.msg_mlp(torch.cat([h[src], h[dst], e], dim=-1)))  # (E, hidden_dim)
 
         # ノード更新（残差）
         aggr = scatter(m, dst, dim=0, dim_size=h.size(0), reduce='sum')
@@ -218,9 +225,9 @@ class ConditionalEncoder(nn.Module):
         # ── Global pooling → Ci ────────────────────────────────────────────
         if batch is None:
             batch = torch.zeros(h.size(0), dtype=torch.long, device=h.device)
-        # num_graphs: batch index から GPU-CPU sync なしで推定
-        num_graphs = batch[-1] + 1 if batch.numel() > 0 else 1
-        g = scatter(h, batch, dim=0, dim_size=num_graphs, reduce='sum')  # (B, hidden_dim)
+        # num_graphs: batch index から GPU-CPU sync なしで推定（int に変換して dim_size に渡す）
+        num_graphs = int(batch[-1]) + 1 if batch.numel() > 0 else 1
+        g = scatter(h, batch, dim=0, dim_size=num_graphs, reduce='mean')  # (B, hidden_dim)
         g_expand = g[batch]                  # (N, hidden_dim)
         cond = self.global_proj(torch.cat([h, g_expand], dim=-1))  # (N, hidden_dim)
 

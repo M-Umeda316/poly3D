@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch_scatter import scatter
+from torch_scatter import scatter, scatter_mean
 
 from poly3d.model.egnn import EGNN
 
@@ -47,11 +47,9 @@ class VAEEncoder(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # Ci を EGNN の入力次元に投影
-        self.input_proj = nn.Linear(cond_dim, hidden_dim)
-
+        # input_proj は EGNN 内部に統合（二重投影を排除）
         self.egnn = EGNN(
-            in_node_dim=hidden_dim,
+            in_node_dim=cond_dim,
             hidden_dim=hidden_dim,
             edge_feat_dim=edge_dim,
             n_layers=n_layers,
@@ -75,8 +73,7 @@ class VAEEncoder(nn.Module):
         mu     : (N, latent_dim)
         logvar : (N, latent_dim)
         """
-        h0 = self.input_proj(cond)   # (N, hidden_dim)
-        h, _ = self.egnn(h0, pos, edge_index, e_cond, batch)
+        h, _ = self.egnn(cond, pos, edge_index, e_cond, batch)
         mu = self.mu_head(h)
         # exp(logvar) が float32 でオーバーフローしないよう clamp
         # exp(10) ≈ 22026（十分大きな分散）、exp(-10) ≈ 4.5e-5（ほぼ決定論的）
@@ -106,7 +103,6 @@ class VAEDecoder(nn.Module):
         super().__init__()
 
         in_dim = latent_dim + cond_dim
-        self.input_proj = nn.Linear(in_dim, hidden_dim)
 
         # 初期座標推定 MLP: [Z; Ci] → 3
         self.init_pos = nn.Sequential(
@@ -121,8 +117,9 @@ class VAEDecoder(nn.Module):
         nn.init.normal_(self.init_pos[-1].weight, std=0.01)
         nn.init.zeros_(self.init_pos[-1].bias)
 
+        # input_proj は EGNN 内部に統合（二重投影を排除）
         self.egnn = EGNN(
-            in_node_dim=hidden_dim,
+            in_node_dim=in_dim,
             hidden_dim=hidden_dim,
             edge_feat_dim=edge_dim,
             n_layers=n_layers,
@@ -141,8 +138,7 @@ class VAEDecoder(nn.Module):
         -------
         pos_pred : (N, 3)
         """
-        feat = torch.cat([z, cond], dim=-1)
-        h0 = self.input_proj(feat)
+        feat = torch.cat([z, cond], dim=-1)   # (N, latent_dim + cond_dim)
 
         # 初期座標をノード特徴量から推定（ノードごとに異なる値）
         x0 = self.init_pos(feat)
@@ -151,18 +147,16 @@ class VAEDecoder(nn.Module):
         if batch is None:
             x0 = x0 - x0.mean(dim=0, keepdim=True)
         else:
-            from torch_scatter import scatter_mean
             mean = scatter_mean(x0, batch, dim=0)
             x0 = x0 - mean[batch]
 
-        _, pos_pred = self.egnn(h0, x0, edge_index, e_cond, batch)
+        _, pos_pred = self.egnn(feat, x0, edge_index, e_cond, batch)
 
         # 出力も重心ゼロに正規化
         if batch is None:
             pos_pred = pos_pred - pos_pred.mean(dim=0, keepdim=True)
         else:
-            from torch_scatter import scatter_mean as _sm
-            mean = _sm(pos_pred, batch, dim=0)
+            mean = scatter_mean(pos_pred, batch, dim=0)
             pos_pred = pos_pred - mean[batch]
 
         return pos_pred
@@ -258,10 +252,3 @@ class StructuralVAE(nn.Module):
         pos_pred = self.decode(z, cond, edge_index, e_cond, batch)
         return pos_pred, mu, logvar
 
-    def kl_loss(self, mu: Tensor, logvar: Tensor) -> Tensor:
-        """KL(q(Z|X) || N(0,I)) の平均"""
-        return (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).mean()
-
-    @torch.no_grad()
-    def sample_z(self, n_atoms: int, device: torch.device) -> Tensor:
-        return torch.randn(n_atoms, self.latent_dim, device=device)
