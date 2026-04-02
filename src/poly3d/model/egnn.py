@@ -9,12 +9,10 @@ SE(3)-同変なメッセージパッシングを実装する。
 """
 from __future__ import annotations
 
-import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 from torch_scatter import scatter
 
@@ -33,7 +31,7 @@ class EGNNLayer(nn.Module):
     メッセージ計算:
         m_ij = φ_e(h_i, h_j, d_ij², e_ij)
     座標更新（並進不変・回転同変）:
-        Δx_i = Σ_j (x_i - x_j) * φ_x(m_ij) / (|N_i| + 1)
+        Δx_i = Σ_j (x_i - x_j) * φ_x(m_ij) / max(|N_i|, 1)
     ノード更新（残差接続あり）:
         h_i' = h_i + φ_h(h_i, Σ_j m_ij)
     """

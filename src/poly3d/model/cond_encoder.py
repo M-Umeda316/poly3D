@@ -32,7 +32,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch_scatter import scatter, scatter_mean
+from torch_scatter import scatter
 
 from poly3d.model.features import (
     ATOM_TYPE_VOCAB, HYBRIDIZATION_VOCAB, BOND_TYPE_VOCAB,

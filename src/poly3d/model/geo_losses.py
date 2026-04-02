@@ -50,8 +50,9 @@ def build_angle_triplets(edge_index: Tensor, num_nodes: int) -> Tensor:
     edge_index (2, E) から 3原子トリプレット (i, j, k) を構築。
     j を中心とする i-j-k ペア（i ≠ k）。
 
-    完全ベクトル化実装: Python ループなし、.item() 呼び出しなし。
-    バッチ全体で一度に処理するため GPU-CPU 同期なし。
+    完全ベクトル化実装: Python ループなし。
+    可変長 arange 生成のため .item() を 1 回使用するが、
+    DataLoader ワーカー（CPU）上で呼ぶため GPU-CPU 同期コストなし。
 
     Returns
     -------
@@ -121,7 +122,9 @@ def build_dihedral_quartets(edge_index: Tensor, num_nodes: int) -> Tensor:
     edge_index (2, E) から 4原子カルテット (i, j, k, l) を構築。
     j-k を軸とする i-j-k-l。
 
-    完全ベクトル化実装: Python ループなし、.item() 呼び出しなし。
+    完全ベクトル化実装: Python ループなし。
+    可変長テンソル生成のため .item() を 2 回使用するが、
+    DataLoader ワーカー（CPU）上で呼ぶため GPU-CPU 同期コストなし。
 
     Phase 1: 各無向エッジ (j,k) に対して i ∈ N(j)\\{k} を展開
     Phase 2: 各 (e,i) ペアに対して l ∈ N(k)\\{j,i} を展開

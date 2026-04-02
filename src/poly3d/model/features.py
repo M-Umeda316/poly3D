@@ -281,12 +281,11 @@ def mol_to_data(
         'bond_type_idx': bt_idx_arr,
         'bond_cont': bc_arr,
         'edge_index': edge_index,
+        'n_atoms': n,
         'pos': pos,
         'atomic_nums': np.array([a.GetAtomicNum() for a in mol.GetAtoms()], dtype=np.int32),
         'sid': sid,
     }
-
-    data['n_atoms'] = n
 
     if use_rwpe:
         data['rwpe'] = compute_rwpe(edge_index, n)

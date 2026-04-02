@@ -26,8 +26,10 @@ from rdkit import Chem
 from torch_geometric.data import Data
 
 from poly3d.model.builder import build_cond_encoder, build_vae, build_dit
+from poly3d.model.cond_encoder import ConditionalEncoder
 from poly3d.model.flow_matching import FlowMatching
 from poly3d.model.features import smiles_to_data
+from poly3d.model.vae import StructuralVAE
 
 
 def parse_args() -> argparse.Namespace:

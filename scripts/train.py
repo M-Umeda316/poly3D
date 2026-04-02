@@ -222,7 +222,7 @@ class VAETrainer:
 
         params = (list(self.cond_encoder.parameters())
                   + list(self.vae.parameters()))
-        # torch.compile（DDP 前に適用）
+        # torch.compile（DDP ラップ後でも PyTorch 2.x では動作する）
         if args.compile and hasattr(torch, 'compile'):
             self.cond_encoder = torch.compile(self.cond_encoder, dynamic=True)
             self.vae = torch.compile(self.vae, dynamic=True)

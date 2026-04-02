@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch_scatter import scatter, scatter_mean
+from torch_scatter import scatter_mean
 
 from poly3d.model.egnn import EGNN
 
