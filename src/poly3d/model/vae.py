@@ -198,11 +198,9 @@ class StructuralVAE(nn.Module):
         )
 
     def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
-        if self.training:
-            std = (0.5 * logvar).exp()
-            eps = torch.randn_like(std)
-            return mu + std * eps
-        return mu
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        return mu + std * eps
 
     def encode(
         self,
