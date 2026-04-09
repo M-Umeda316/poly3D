@@ -75,7 +75,7 @@ class FlowMatching(nn.Module):
         loss     : scalar
         loss_dict: {'flow': float}
         """
-        B = int(batch[-1]) + 1 if batch.numel() > 0 else 1
+        B = batch.max().item() + 1 if batch.numel() > 0 else 1
         N = z0.size(0)
         device = z0.device
 
@@ -105,8 +105,9 @@ class FlowMatching(nn.Module):
         z1_pred = self.model(zt, cond, t, batch, z_sc=z_sc, attn_bias=attn_bias)
 
         # 損失: 1/(1-t)^2 * ||Z1 - Z1_pred||^2 の平均
+        # ||.||^2 は L2 ノルムの二乗（sum）であり mean ではない
         weight = 1.0 / (1.0 - t_node).pow(2).clamp(min=1e-4)
-        flow_loss = (weight * (z1 - z1_pred).pow(2).mean(dim=-1)).mean()
+        flow_loss = (weight * (z1 - z1_pred).pow(2).sum(dim=-1)).mean()
 
         return flow_loss, {'flow': flow_loss.detach()}
 
@@ -131,7 +132,7 @@ class FlowMatching(nn.Module):
         if device is None:
             device = cond.device
 
-        B = int(batch[-1]) + 1 if batch.numel() > 0 else 1
+        B = batch.max().item() + 1 if batch.numel() > 0 else 1
         raw = _unwrap_model(self.model)
         latent_dim = raw.latent_dim
 

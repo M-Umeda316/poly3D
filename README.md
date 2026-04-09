@@ -176,6 +176,7 @@ torchrun \
 | `--hidden_dim` | 128 | ConditionalEncoder 隠れ次元 |
 | `--latent_dim` | 16 | 潜在変数次元 |
 | `--beta_warmup_epochs` | 50 | KL warm-up エポック数 |
+| `--pos_loss_type` | kabsch | 座標損失の種類（`kabsch` / `distmat`）→ 後述 |
 | `--dit_hidden_dim` | 256 | DiT 隠れ次元 |
 | `--dit_n_layers` | 6 | DiT 層数 |
 
@@ -185,6 +186,22 @@ torchrun \
 |---|---|---|---|
 | RTX4060Ti 16GB / Ryzen9 7900X | 64 | 8 | 2 |
 | RTX5000 Ada 32GB / Xeon 8558 | 128 | 16 | 2 |
+
+### 座標損失の選択（`--pos_loss_type`）
+
+VAE Stage 1 の座標損失は回転・並進不変な指標を使用する。
+
+| 値 | 内容 | 特徴 |
+|---|---|---|
+| `kabsch`（デフォルト）| Kabsch RMSD: SVD で最適回転を求めてアライメント後に MSE | O(n) / molecule、精度高 |
+| `distmat` | 全原子ペア距離行列の MSE | SVD 不要でシンプル、O(n²) / molecule |
+
+```bash
+# 距離行列損失に切り替える場合
+python scripts/train.py --stage vae ... --pos_loss_type distmat
+```
+
+旧来の座標 MSE（回転非不変）は廃止済み。
 
 ### TensorBoard
 
@@ -248,7 +265,7 @@ poly3D/
 │       │   ├── egnn.py             # SE(3)-equivariant GNN
 │       │   ├── cond_encoder.py     # Graph Conditioning（MPNN + mean global pooling）
 │       │   ├── vae.py              # Structural VAE（Encoder + Decoder）
-│       │   ├── geo_losses.py       # 幾何損失（bond / angle / dihedral）
+│       │   ├── geo_losses.py       # 幾何損失（bond / angle / dihedral / Kabsch RMSD / distmat）
 │       │   ├── vae_loss.py         # VAE 損失の組み立て
 │       │   ├── pos_bias.py         # グラフ距離 → attention bias
 │       │   ├── dit.py              # Latent DiT

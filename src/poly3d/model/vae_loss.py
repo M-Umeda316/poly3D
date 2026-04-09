@@ -4,7 +4,9 @@ VAE 学習損失
 L = w_pos * Lpos + w_bond * Lbond + w_angle * Langle + w_dih * Ldihedral + beta * Lkl
 
 各損失:
-  Lpos      : 座標 MSE
+  Lpos      : 回転・並進不変な座標損失（pos_loss_type で切り替え可）
+                'kabsch'  : Kabsch RMSD（デフォルト）
+                'distmat' : 全原子ペア距離行列 MSE
   Lbond     : 結合長 MSE
   Langle    : 結合角 MSE
   Ldihedral : 二面角損失 (1 - cos(φ_pred - φ_gt))
@@ -14,7 +16,7 @@ beta は学習初期に 0 から 1 に warm-up する (KL annealing)。
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +25,7 @@ from torch import Tensor
 from poly3d.model.geo_losses import (
     angle_loss, dihedral_loss,
     build_angle_triplets, build_dihedral_quartets,
+    kabsch_rmsd_loss, dist_matrix_loss,
 )
 
 
@@ -52,24 +55,36 @@ def vae_loss(
     # 事前計算済みトポロジー（None の場合はここで計算）
     triplets: Optional[Tensor] = None,
     quartets: Optional[Tensor] = None,
+    # 座標損失の種類: 'kabsch'（回転不変 RMSD）または 'distmat'（距離行列 MSE）
+    pos_loss_type: Literal['kabsch', 'distmat'] = 'kabsch',
+    batch: Optional[Tensor] = None,
 ) -> Tuple[Tensor, dict]:
     """
     Parameters
     ----------
-    pos_pred  : (N, 3) 予測座標
-    pos_gt    : (N, 3) 正解座標
-    mu, logvar: (N, latent_dim)
-    edge_index: (2, E)
-    num_nodes : N
-    beta      : KL 損失の重み（warm-up で変化させる）
+    pos_pred      : (N, 3) 予測座標
+    pos_gt        : (N, 3) 正解座標
+    mu, logvar    : (N, latent_dim)
+    edge_index    : (2, E)
+    num_nodes     : N
+    beta          : KL 損失の重み（warm-up で変化させる）
+    pos_loss_type : 座標損失の種類（'kabsch' or 'distmat'）
+    batch         : (N,) 分子インデックス。None の場合は単一分子として扱う
 
     Returns
     -------
     total_loss : scalar
     loss_dict  : 各損失の値（float）
     """
-    # 座標 MSE
-    l_pos = F.mse_loss(pos_pred, pos_gt)
+    # batch が None の場合は全原子を1分子として扱う
+    if batch is None:
+        batch = pos_pred.new_zeros(num_nodes, dtype=torch.long)
+
+    # 座標損失（回転・並進不変）
+    if pos_loss_type == 'distmat':
+        l_pos = dist_matrix_loss(pos_pred, pos_gt, batch)
+    else:
+        l_pos = kabsch_rmsd_loss(pos_pred, pos_gt, batch)
 
     # 結合長
     l_bond = bond_length_loss(pos_pred, pos_gt, edge_index)

@@ -126,7 +126,7 @@ poly3D/
 │       │   ├── egnn.py         # SE(3)-同変 GNN（汎用プリミティブ）
 │       │   ├── cond_encoder.py # Graph Conditioning（トポロジー→Ci）
 │       │   ├── vae.py          # Structural VAE（Encoder E + Decoder D）
-│       │   ├── geo_losses.py   # 幾何損失（bond/angle/dihedral）
+│       │   ├── geo_losses.py   # 幾何損失（bond/angle/dihedral/Kabsch RMSD/distmat）
 │       │   ├── vae_loss.py     # VAE 損失の組み立て
 │       │   ├── pos_bias.py     # グラフ距離 → attention bias
 │       │   ├── dit.py          # Latent DiT（block-diagonal attention）
@@ -166,7 +166,7 @@ SMILES → ConditionalEncoder → h_cond, e_cond, Ci
 
 | 損失 | 内容 | 重み |
 |------|------|------|
-| Lpos | 座標 MSE | 1.0 |
+| Lpos | Kabsch RMSD（回転・並進不変） or 距離行列 MSE | 1.0 |
 | Lbond | 結合長 MSE | 1.0 |
 | Langle | 結合角 MSE | 0.5 |
 | Ldihedral | 二面角損失 (1-cos) | 0.1 |

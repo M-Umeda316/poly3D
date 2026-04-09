@@ -101,7 +101,7 @@ def test_vae():
     ).to(device)
 
     N, E = 12, 18
-    batch = torch.zeros(N, dtype=torch.long, device=device)
+    batch = torch.tensor([0]*7 + [1]*5, dtype=torch.long, device=device)
     ei = torch.randint(0, N, (2, E), device=device)
     pos_gt = torch.randn(N, 3, device=device)
 
@@ -120,7 +120,7 @@ def test_vae():
     assert pos_pred.shape == (N, 3)
     assert mu.shape == (N, 8)
 
-    loss, ld = vae_loss(pos_pred, pos_gt, mu, logvar, ei, N, beta=0.01)
+    loss, ld = vae_loss(pos_pred, pos_gt, mu, logvar, ei, N, beta=0.01, batch=batch)
     assert not torch.isnan(loss), f'loss NaN'
     print(f'  pos_pred={pos_pred.shape}, loss={loss.item():.4f}, keys={list(ld.keys())}')
     return True

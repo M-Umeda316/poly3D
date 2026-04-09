@@ -9,6 +9,7 @@ RWPE (Random Walk Positional Encoding) と LapPE (Laplacian PE) の計算も担�
 """
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -194,8 +195,8 @@ def compute_lappe(
         vecs = eigvecs[:, order[1:k+1]]  # (N, ≤k)
         n_actual = vecs.shape[1]
         pe[:, :n_actual] = vecs.astype(np.float32)
-    except Exception:
-        pass
+    except Exception as e:
+        warnings.warn(f'LapPE 計算失敗（ゼロで代替）: {e}')
 
     return pe
 

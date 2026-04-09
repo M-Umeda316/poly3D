@@ -153,6 +153,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--w_bond', type=float, default=1.0)
     p.add_argument('--w_angle', type=float, default=0.5)
     p.add_argument('--w_dihedral', type=float, default=0.1)
+    p.add_argument('--pos_loss_type', type=str, default='kabsch',
+                   choices=['kabsch', 'distmat'],
+                   help='座標損失の種類: kabsch（Kabsch RMSD）または distmat（距離行列 MSE）')
 
     # DiT
     p.add_argument('--dit_hidden_dim', type=int, default=256)
@@ -286,8 +289,9 @@ class VAETrainer:
         self.scheduler.load_state_dict(ckpt['scheduler'])
         self.start_epoch = ckpt['epoch'] + 1
         self.best_val_loss = ckpt.get('val_loss', float('inf'))
+        self.global_step = ckpt.get('global_step', 0)
         if is_main_process():
-            print(f'Resume: {path} (epoch {ckpt["epoch"]})')
+            print(f'Resume: {path} (epoch {ckpt["epoch"]}, step {self.global_step})')
 
     def _save(self, epoch: int, val_loss: float):
         if not is_main_process():
@@ -299,6 +303,7 @@ class VAETrainer:
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'val_loss': val_loss,
+            'global_step': self.global_step,
             'args': vars(self.args),
         }
         torch.save(ckpt, self.out_dir / f'vae_epoch{epoch:04d}.pt')
@@ -353,6 +358,8 @@ class VAETrainer:
                         # ワーカーで事前計算済み（None なら vae_loss 内でオンザフライ計算）
                         triplets=getattr(batch, 'triplets', None),
                         quartets=getattr(batch, 'quartets', None),
+                        pos_loss_type=self.args.pos_loss_type,
+                        batch=batch.batch,
                     )
 
             if train:
@@ -567,8 +574,9 @@ class DiTTrainer:
         self.scheduler.load_state_dict(ckpt['scheduler'])
         self.start_epoch = ckpt['epoch'] + 1
         self.best_val_loss = ckpt.get('val_loss', float('inf'))
+        self.global_step = ckpt.get('global_step', 0)
         if is_main_process():
-            print(f'Resume DiT: {path} (epoch {ckpt["epoch"]})')
+            print(f'Resume DiT: {path} (epoch {ckpt["epoch"]}, step {self.global_step})')
 
     def _save(self, epoch: int, val_loss: float):
         if not is_main_process():
@@ -580,6 +588,7 @@ class DiTTrainer:
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'val_loss': val_loss,
+            'global_step': self.global_step,
             'args': vars(self.args),
         }
         torch.save(ckpt, self.out_dir / f'dit_epoch{epoch:04d}.pt')
@@ -795,6 +804,8 @@ def _benchmark_vae(trainer: VAETrainer, n_batches: int):
                 w_angle=trainer.args.w_angle, w_dihedral=trainer.args.w_dihedral,
                 triplets=getattr(batch, 'triplets', None),
                 quartets=getattr(batch, 'quartets', None),
+                pos_loss_type=trainer.args.pos_loss_type,
+                batch=batch.batch,
             )
         if use_cuda:
             torch.cuda.synchronize(device)

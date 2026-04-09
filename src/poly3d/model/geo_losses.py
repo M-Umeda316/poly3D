@@ -8,11 +8,17 @@ build_angle_triplets / build_dihedral_quartets は Pythonループなし・
 .item() 呼び出しなし の完全ベクトル化実装。
 DataLoader ワーカーで per-molecule 事前計算して collate_fn でオフセット付き
 concat することで、学習ループの GPU ホットパスから除去することも可能。
+
+座標損失（回転・並進不変）:
+  kabsch_rmsd_loss : 最適回転アライメント後の MSE（Kabsch アルゴリズム）
+  dist_matrix_loss : 全原子ペア距離行列の MSE
 """
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
+from torch_scatter import scatter, scatter_mean
 
 
 def _angle_between(v1: Tensor, v2: Tensor, eps: float = 1e-8) -> Tensor:
@@ -271,3 +277,101 @@ def dihedral_loss(pos_pred: Tensor, pos_gt: Tensor, quartets: Tensor) -> Tensor:
         )
 
     return (1.0 - torch.cos(phi_pred - phi_gt)).mean()
+
+
+# ── 回転・並進不変な座標損失 ─────────────────────────────────────────────────────
+
+def kabsch_rmsd_loss(pos_pred: Tensor, pos_gt: Tensor, batch: Tensor) -> Tensor:
+    """
+    Kabsch アルゴリズムによる回転・並進不変な座標損失。
+
+    分子ごとに最適回転行列 R を SVD で求め、pos_pred を R で回転させてから
+    pos_gt との MSE を計算する。勾配は pos_pred を通じて流れる。
+
+    R は pos_pred に対する最適回転（argmin）であり、envelope theorem により
+    R を detach しても Kabsch 損失の正確な勾配が得られる。SVD 逆伝播の
+    特異値縮退による不安定性も回避される。
+
+    scatter + バッチ SVD による完全ベクトル化: Python ループなし。
+
+    Parameters
+    ----------
+    pos_pred : (N, 3)  予測座標
+    pos_gt   : (N, 3)  正解座標
+    batch    : (N,) int  バッチ内の分子インデックス（0, 0, ..., 1, 1, ...）
+
+    Returns
+    -------
+    scalar loss  (分子ごとの MSE の平均)
+    """
+    # 重心除去（ベクトル化）
+    P_mean = scatter_mean(pos_pred, batch, dim=0)   # (B, 3)
+    Q_mean = scatter_mean(pos_gt, batch, dim=0)     # (B, 3)
+    P = pos_pred - P_mean[batch]                     # (N, 3)
+    Q_c = pos_gt - Q_mean[batch]                     # (N, 3)
+
+    # 相関行列 H_m = Σ_{i∈m} P_i ⊗ Q_i を scatter_add で計算
+    outer = P.unsqueeze(2) * Q_c.unsqueeze(1)        # (N, 3, 3)
+    H = scatter(outer, batch, dim=0, reduce='add')   # (B, 3, 3)
+
+    # SVD は fp32 で実行（AMP bf16/fp16 時の数値安定性確保）
+    # 特異値縮退対策として微小摂動を加算
+    H_f32 = H.float() + 1e-6 * torch.eye(3, device=H.device).unsqueeze(0)
+    U, _S, Vh = torch.linalg.svd(H_f32)
+
+    # reflection 補正 + 最適回転行列
+    # autocast スコープ内では matmul が bf16 にキャストされ det が失敗するため
+    # 明示的に fp32 を強制する
+    with torch.no_grad(), torch.autocast(device_type=H.device.type, enabled=False):
+        VhT_UT = Vh.mT @ U.mT                        # (B, 3, 3)  fp32
+        d = torch.det(VhT_UT).sign()                  # (B,)
+        D = torch.zeros_like(H_f32)
+        D[:, 0, 0] = 1.0
+        D[:, 1, 1] = 1.0
+        D[:, 2, 2] = d
+        R = (Vh.mT @ D @ U.mT).to(pos_pred.dtype)    # (B, 3, 3) → 元の dtype
+
+    # 回転適用: P_rot[i] = R[batch[i]] @ P[i]
+    P_rot = torch.einsum('nij,nj->ni', R[batch], P)  # (N, 3)
+
+    # 分子ごとの MSE の平均
+    per_atom_mse = (P_rot - Q_c).pow(2).mean(dim=-1)     # (N,)
+    mol_mse = scatter_mean(per_atom_mse, batch, dim=0)    # (B,)
+    return mol_mse.mean()
+
+
+def dist_matrix_loss(pos_pred: Tensor, pos_gt: Tensor, batch: Tensor) -> Tensor:
+    """
+    全原子ペア距離行列の MSE による回転・並進不変な座標損失。
+
+    kabsch_rmsd_loss の代替手段として用意。切り替えは vae_loss の
+    pos_loss_type 引数で行う。
+
+    計算量は O(n²) / molecule。大きな分子では kabsch_rmsd_loss の方が
+    効率的だが、こちらは SVD なしでシンプルに回転不変性を確保できる。
+
+    Parameters
+    ----------
+    pos_pred : (N, 3)  予測座標
+    pos_gt   : (N, 3)  正解座標
+    batch    : (N,) int  バッチ内の分子インデックス
+
+    Returns
+    -------
+    scalar loss  (分子ごとの距離行列 MSE の平均)
+    """
+    device_type = pos_pred.device.type if pos_pred.device.type != 'cpu' else 'cpu'
+    losses = []
+    for mol_id in batch.unique():
+        mask = batch == mol_id
+        P = pos_pred[mask]          # (n, 3)
+        Q = pos_gt[mask]            # (n, 3)
+
+        # cdist の二乗計算が bf16 で精度劣化するため fp32 を強制
+        with torch.autocast(device_type=device_type, enabled=False):
+            d_pred = torch.cdist(P.float(), P.float())  # (n, n)
+            with torch.no_grad():
+                d_gt = torch.cdist(Q.float(), Q.float())
+            losses.append(F.mse_loss(d_pred, d_gt))
+
+    return torch.stack(losses).mean()
