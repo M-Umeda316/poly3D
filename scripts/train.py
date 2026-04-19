@@ -40,6 +40,9 @@ from __future__ import annotations
 import argparse
 import os
 import time
+
+# CUDA アロケータの断片化緩和（torch import より前に設定）
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
@@ -307,6 +310,8 @@ class VAETrainer:
             'args': vars(self.args),
         }
         torch.save(ckpt, self.out_dir / f'vae_epoch{epoch:04d}.pt')
+        if epoch > self.args.save_every:
+            os.remove(self.out_dir / f'vae_epoch{epoch-self.args.save_every:04d}.pt')
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
             torch.save(ckpt, self.out_dir / 'vae_best.pt')
@@ -332,48 +337,60 @@ class VAETrainer:
                 continue
             batch = batch.to(self.device)
 
-            with torch.set_grad_enabled(train):
-                with torch.autocast(device_type=self.device.type,
-                                    dtype=self.amp_dtype, enabled=self.amp_enabled):
-                    h_cond, e_cond, cond = self.cond_encoder(
-                        batch.atom_type_idx, batch.hyb_idx, batch.atom_cont,
-                        batch.bond_type_idx, batch.bond_cont, batch.edge_index,
-                        rwpe=getattr(batch, 'rwpe', None),
-                        lappe=getattr(batch, 'lappe', None),
-                        batch=batch.batch,
-                    )
-                    pos_pred, mu, logvar = self.vae(
-                        cond, batch.pos, batch.edge_index, e_cond, batch.batch
-                    )
+            try:
+                with torch.set_grad_enabled(train):
+                    with torch.autocast(device_type=self.device.type,
+                                        dtype=self.amp_dtype, enabled=self.amp_enabled):
+                        h_cond, e_cond, cond = self.cond_encoder(
+                            batch.atom_type_idx, batch.hyb_idx, batch.atom_cont,
+                            batch.bond_type_idx, batch.bond_cont, batch.edge_index,
+                            rwpe=getattr(batch, 'rwpe', None),
+                            lappe=getattr(batch, 'lappe', None),
+                            batch=batch.batch,
+                        )
+                        pos_pred, mu, logvar = self.vae(
+                            cond, batch.pos, batch.edge_index, e_cond, batch.batch
+                        )
 
-                    num_nodes = batch.pos.size(0)
-                    loss, ld = vae_loss(
-                        pos_pred, batch.pos, mu, logvar,
-                        batch.edge_index, num_nodes,
-                        beta=beta,
-                        w_pos=self.args.w_pos,
-                        w_bond=self.args.w_bond,
-                        w_angle=self.args.w_angle,
-                        w_dihedral=self.args.w_dihedral,
-                        # ワーカーで事前計算済み（None なら vae_loss 内でオンザフライ計算）
-                        triplets=getattr(batch, 'triplets', None),
-                        quartets=getattr(batch, 'quartets', None),
-                        pos_loss_type=self.args.pos_loss_type,
-                        batch=batch.batch,
-                    )
+                        num_nodes = batch.pos.size(0)
+                        loss, ld = vae_loss(
+                            pos_pred, batch.pos, mu, logvar,
+                            batch.edge_index, num_nodes,
+                            beta=beta,
+                            w_pos=self.args.w_pos,
+                            w_bond=self.args.w_bond,
+                            w_angle=self.args.w_angle,
+                            w_dihedral=self.args.w_dihedral,
+                            # ワーカーで事前計算済み（None なら vae_loss 内でオンザフライ計算）
+                            triplets=getattr(batch, 'triplets', None),
+                            quartets=getattr(batch, 'quartets', None),
+                            pos_loss_type=self.args.pos_loss_type,
+                            batch=batch.batch,
+                        )
 
-            if train:
-                # 勾配累積: accum ステップで 1 回最適化
-                (loss / accum).backward()
+                if train:
+                    # 勾配累積: accum ステップで 1 回最適化
+                    (loss / accum).backward()
 
-                is_last_step = (step + 1 >= n_batches)
-                if (step + 1) % accum == 0 or is_last_step:
-                    nn.utils.clip_grad_norm_(
-                        list(self.cond_encoder.parameters()) + list(self.vae.parameters()),
-                        self.args.grad_clip,
-                    )
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    is_last_step = (step + 1 >= n_batches)
+                    if (step + 1) % accum == 0 or is_last_step:
+                        nn.utils.clip_grad_norm_(
+                            list(self.cond_encoder.parameters()) + list(self.vae.parameters()),
+                            self.args.grad_clip,
+                        )
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+            except torch.cuda.OutOfMemoryError:
+                # 巨大分子バッチで一時的に VRAM 不足 → 勾配を捨ててスキップし学習継続
+                if is_main_process():
+                    n_atoms = int(batch.pos.size(0))
+                    print(f'[OOM] epoch skip step={step} n_atoms={n_atoms} — バッチを破棄')
+                self.optimizer.zero_grad(set_to_none=True)
+                del batch
+                if 'loss' in locals():
+                    del loss
+                torch.cuda.empty_cache()
+                continue
 
             # detach テンソル → float 変換（バッチ末でまとめて sync）
             for k, v in ld.items():
@@ -592,6 +609,8 @@ class DiTTrainer:
             'args': vars(self.args),
         }
         torch.save(ckpt, self.out_dir / f'dit_epoch{epoch:04d}.pt')
+        if epoch > self.args.save_every:
+            os.remove(self.out_dir / f'dit_epoch{epoch-self.args.save_every:04d}.pt')
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
             torch.save(ckpt, self.out_dir / 'dit_best.pt')
@@ -619,44 +638,55 @@ class DiTTrainer:
             # dist_mat: ワーカーで事前計算済みのブロック対角距離行列
             dist_mat = getattr(batch, 'dist_mat', None)
 
-            if self.use_latent:
-                # LatentDataset モード: エンコード済みデータを直接使用
-                z0   = batch.z0      # (N, latent_dim)
-                cond = batch.cond    # (N, cond_dim)
-                # e_cond はバッチ内で使用しない（FlowMatching は cond のみ使用）
-            else:
-                # 凍結モデル（勾配不要）: bf16 で推論し高速化
-                with torch.no_grad():
+            try:
+                if self.use_latent:
+                    # LatentDataset モード: エンコード済みデータを直接使用
+                    z0   = batch.z0      # (N, latent_dim)
+                    cond = batch.cond    # (N, cond_dim)
+                    # e_cond はバッチ内で使用しない（FlowMatching は cond のみ使用）
+                else:
+                    # 凍結モデル（勾配不要）: bf16 で推論し高速化
+                    with torch.no_grad():
+                        with torch.autocast(device_type=self.device.type,
+                                            dtype=self.amp_dtype, enabled=self.amp_enabled):
+                            _, e_cond, cond = self.cond_encoder(
+                                batch.atom_type_idx, batch.hyb_idx, batch.atom_cont,
+                                batch.bond_type_idx, batch.bond_cont, batch.edge_index,
+                                rwpe=getattr(batch, 'rwpe', None),
+                                lappe=getattr(batch, 'lappe', None),
+                                batch=batch.batch,
+                            )
+                            mu, _ = self.vae.encoder(
+                                cond, batch.pos, batch.edge_index, e_cond, batch.batch
+                            )
+                            z0 = mu
+
+                with torch.set_grad_enabled(train):
                     with torch.autocast(device_type=self.device.type,
                                         dtype=self.amp_dtype, enabled=self.amp_enabled):
-                        _, e_cond, cond = self.cond_encoder(
-                            batch.atom_type_idx, batch.hyb_idx, batch.atom_cont,
-                            batch.bond_type_idx, batch.bond_cont, batch.edge_index,
-                            rwpe=getattr(batch, 'rwpe', None),
-                            lappe=getattr(batch, 'lappe', None),
-                            batch=batch.batch,
+                        loss, ld = self.flow.loss(
+                            z0, cond, batch.batch, batch.edge_index,
+                            dist_mat=dist_mat,
                         )
-                        mu, _ = self.vae.encoder(
-                            cond, batch.pos, batch.edge_index, e_cond, batch.batch
-                        )
-                        z0 = mu
 
-            with torch.set_grad_enabled(train):
-                with torch.autocast(device_type=self.device.type,
-                                    dtype=self.amp_dtype, enabled=self.amp_enabled):
-                    loss, ld = self.flow.loss(
-                        z0, cond, batch.batch, batch.edge_index,
-                        dist_mat=dist_mat,
-                    )
+                if train:
+                    (loss / accum).backward()
 
-            if train:
-                (loss / accum).backward()
-
-                is_last_step = (step + 1 >= n_batches)
-                if (step + 1) % accum == 0 or is_last_step:
-                    nn.utils.clip_grad_norm_(self.flow.parameters(), self.args.grad_clip)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    is_last_step = (step + 1 >= n_batches)
+                    if (step + 1) % accum == 0 or is_last_step:
+                        nn.utils.clip_grad_norm_(self.flow.parameters(), self.args.grad_clip)
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+            except torch.cuda.OutOfMemoryError:
+                if is_main_process():
+                    n_atoms = int(batch.pos.size(0)) if hasattr(batch, 'pos') else -1
+                    print(f'[OOM] DiT step skip step={step} n_atoms={n_atoms} — バッチを破棄')
+                self.optimizer.zero_grad(set_to_none=True)
+                del batch
+                if 'loss' in locals():
+                    del loss
+                torch.cuda.empty_cache()
+                continue
 
             for k, v in ld.items():
                 v_f = v.item() if isinstance(v, torch.Tensor) else v
