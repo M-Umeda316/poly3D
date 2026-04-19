@@ -380,7 +380,9 @@ class VAETrainer:
                         )
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
-            except torch.cuda.OutOfMemoryError:
+            except (torch.cuda.OutOfMemoryError, torch.AcceleratorError) as e:
+                if not isinstance(e, torch.cuda.OutOfMemoryError) and 'out of memory' not in str(e).lower():
+                    raise
                 # 巨大分子バッチで一時的に VRAM 不足 → 勾配を捨ててスキップし学習継続
                 if is_main_process():
                     n_atoms = int(batch.pos.size(0))
@@ -677,7 +679,9 @@ class DiTTrainer:
                         nn.utils.clip_grad_norm_(self.flow.parameters(), self.args.grad_clip)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
-            except torch.cuda.OutOfMemoryError:
+            except (torch.cuda.OutOfMemoryError, torch.AcceleratorError) as e:
+                if not isinstance(e, torch.cuda.OutOfMemoryError) and 'out of memory' not in str(e).lower():
+                    raise
                 if is_main_process():
                     n_atoms = int(batch.pos.size(0)) if hasattr(batch, 'pos') else -1
                     print(f'[OOM] DiT step skip step={step} n_atoms={n_atoms} — バッチを破棄')
