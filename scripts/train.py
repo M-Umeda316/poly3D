@@ -38,6 +38,7 @@ Stage 2: Latent DiT (Flow Matching)
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import time
 
@@ -175,7 +176,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=1e-5)
     p.add_argument('--grad_clip', type=float, default=1.0)
-    p.add_argument('--max_atoms', type=int, default=300)
+    p.add_argument('--max_atoms', type=int, default=240)
     p.add_argument('--num_workers', type=int, default=8,
                    help='DataLoader ワーカー数。Ryzen9 7900X: 8-10、Xeon 8558: 16-20 推奨')
     p.add_argument('--save_every', type=int, default=10)
@@ -385,13 +386,25 @@ class VAETrainer:
                     raise
                 # 巨大分子バッチで一時的に VRAM 不足 → 勾配を捨ててスキップし学習継続
                 if is_main_process():
-                    n_atoms = int(batch.pos.size(0))
+                    n_atoms = int(batch.pos.size(0)) if 'batch' in locals() and batch is not None else -1
                     print(f'[OOM] epoch skip step={step} n_atoms={n_atoms} — バッチを破棄')
                 self.optimizer.zero_grad(set_to_none=True)
-                del batch
-                if 'loss' in locals():
-                    del loss
-                torch.cuda.empty_cache()
+                # autograd graph を保持する中間テンソルを全て解放
+                batch = None
+                loss = None
+                ld = None
+                pos_pred = None
+                mu = None
+                logvar = None
+                h_cond = None
+                e_cond = None
+                cond = None
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception as _ec:
+                    if is_main_process():
+                        print(f'[OOM] empty_cache も失敗: {_ec} — 次バッチで再試行')
                 continue
 
             # detach テンソル → float 変換（バッチ末でまとめて sync）
@@ -466,6 +479,11 @@ class VAETrainer:
 
                 if (epoch % self.args.save_every == 0 or epoch == self.args.epochs) and run_val:
                     self._save(epoch, va['total'])
+
+            # エポック末尾でメモリ掃除（fragmentation 対策）
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if self.writer is not None:
             self.writer.close()
@@ -683,13 +701,26 @@ class DiTTrainer:
                 if not isinstance(e, torch.cuda.OutOfMemoryError) and 'out of memory' not in str(e).lower():
                     raise
                 if is_main_process():
-                    n_atoms = int(batch.pos.size(0)) if hasattr(batch, 'pos') else -1
+                    n_atoms = (int(batch.pos.size(0))
+                               if 'batch' in locals() and batch is not None and hasattr(batch, 'pos')
+                               else -1)
                     print(f'[OOM] DiT step skip step={step} n_atoms={n_atoms} — バッチを破棄')
                 self.optimizer.zero_grad(set_to_none=True)
-                del batch
-                if 'loss' in locals():
-                    del loss
-                torch.cuda.empty_cache()
+                # autograd graph を保持する中間テンソルを全て解放
+                batch = None
+                loss = None
+                ld = None
+                z0 = None
+                cond = None
+                e_cond = None
+                mu = None
+                dist_mat = None
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception as _ec:
+                    if is_main_process():
+                        print(f'[OOM] empty_cache も失敗: {_ec} — 次バッチで再試行')
                 continue
 
             for k, v in ld.items():
@@ -754,6 +785,11 @@ class DiTTrainer:
 
                 if (epoch % self.args.save_every == 0 or epoch == self.args.epochs) and run_val:
                     self._save(epoch, va['flow'])
+
+            # エポック末尾でメモリ掃除（fragmentation 対策）
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if self.writer is not None:
             self.writer.close()
