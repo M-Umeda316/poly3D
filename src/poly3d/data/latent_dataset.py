@@ -127,8 +127,12 @@ def make_latent_dataloader(
     pin_memory: bool = True,
     sampler=None,
     prefetch_factor: int = 4,
+    subset_indices=None,
 ) -> torch.utils.data.DataLoader:
     dataset = LatentDataset(lmdb_path)
+    if subset_indices is not None:
+        from torch.utils.data import Subset
+        dataset = Subset(dataset, subset_indices)
     pf = prefetch_factor if num_workers > 0 else None
     return torch.utils.data.DataLoader(
         dataset,

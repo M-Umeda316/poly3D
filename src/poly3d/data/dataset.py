@@ -187,10 +187,14 @@ def make_dataloader(
     sampler: Optional[torch.utils.data.Sampler] = None,
     prefetch_factor: int = 4,
     precompute_topology: bool = True,
+    subset_indices: Optional[list] = None,
 ) -> torch.utils.data.DataLoader:
     dataset = ConformerDataset(
         lmdb_path, max_atoms=max_atoms, precompute_topology=precompute_topology
     )
+    if subset_indices is not None:
+        from torch.utils.data import Subset
+        dataset = Subset(dataset, subset_indices)
     pf = prefetch_factor if num_workers > 0 else None
     return torch.utils.data.DataLoader(
         dataset,

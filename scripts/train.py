@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import random
 import time
 
 # CUDA アロケータの断片化緩和（torch import より前に設定）
@@ -200,7 +201,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--tb_log_every', type=int, default=100,
                    help='TensorBoard に途中経過を書き込むステップ間隔（0 = エポック末のみ）')
 
+    # ハイパーパラメータ探索用
+    p.add_argument('--subset_ratio', type=float, default=1.0,
+                   help='訓練データのサブセット比率 (0 < r ≤ 1.0)。val は常にフルデータ使用')
+
     return p.parse_args()
+
+
+# ── サブセットユーティリティ ──────────────────────────────────────────────────────
+
+def _make_subset_idx(n: int, ratio: float, seed: int) -> Optional[list]:
+    """比率に応じたランダムサブセットインデックスを返す。ratio >= 1.0 なら None。"""
+    if ratio >= 1.0:
+        return None
+    k = max(1, round(n * ratio))
+    return random.Random(seed).sample(range(n), k)
 
 
 # ── VAE Trainer ────────────────────────────────────────────────────────────────
@@ -247,11 +262,23 @@ class VAETrainer:
         self.optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=args.epochs)
 
+        # サブセットインデックスの計算（subset_ratio < 1.0 の場合のみ）
+        subset_idx: Optional[list] = None
+        if args.subset_ratio < 1.0:
+            from poly3d.data.dataset import ConformerDataset as _CDS
+            _n = len(_CDS(args.train_lmdb, max_atoms=args.max_atoms))
+            subset_idx = _make_subset_idx(_n, args.subset_ratio, args.seed)
+            if is_main_process():
+                print(f'サブセット: {len(subset_idx):,} / {_n:,} サンプル ({args.subset_ratio:.0%})')
+
         # DistributedSampler（分散モード時）
         self.train_sampler: Optional[DistributedSampler] = None
         if dist.is_initialized():
             from poly3d.data.dataset import ConformerDataset
             _ds = ConformerDataset(args.train_lmdb, max_atoms=args.max_atoms)
+            if subset_idx is not None:
+                from torch.utils.data import Subset
+                _ds = Subset(_ds, subset_idx)
             self.train_sampler = DistributedSampler(_ds, shuffle=True, seed=args.seed)
 
         self.train_loader = make_dataloader(
@@ -260,6 +287,7 @@ class VAETrainer:
             num_workers=args.num_workers, max_atoms=args.max_atoms,
             sampler=self.train_sampler,
             prefetch_factor=args.prefetch_factor,
+            subset_indices=subset_idx,
         )
         self.val_loader = make_dataloader(
             args.val_lmdb, batch_size=args.batch_size, shuffle=False,
@@ -554,6 +582,19 @@ class DiTTrainer:
             print(f'  train: {args.latent_lmdb}')
             print(f'  val  : {args.latent_val_lmdb or args.val_lmdb}')
 
+        # サブセットインデックスの計算
+        subset_idx: Optional[list] = None
+        if args.subset_ratio < 1.0:
+            if self.use_latent:
+                from poly3d.data.latent_dataset import LatentDataset as _LDS
+                _n = len(_LDS(args.latent_lmdb))
+            else:
+                from poly3d.data.dataset import ConformerDataset as _CDS
+                _n = len(_CDS(args.train_lmdb, max_atoms=args.max_atoms))
+            subset_idx = _make_subset_idx(_n, args.subset_ratio, args.seed)
+            if is_main_process():
+                print(f'サブセット: {len(subset_idx):,} / {_n:,} サンプル ({args.subset_ratio:.0%})')
+
         # DistributedSampler
         self.train_sampler: Optional[DistributedSampler] = None
         if dist.is_initialized():
@@ -563,6 +604,9 @@ class DiTTrainer:
             else:
                 from poly3d.data.dataset import ConformerDataset
                 _ds = ConformerDataset(args.train_lmdb, max_atoms=args.max_atoms)
+            if subset_idx is not None:
+                from torch.utils.data import Subset
+                _ds = Subset(_ds, subset_idx)
             self.train_sampler = DistributedSampler(_ds, shuffle=True, seed=args.seed)
 
         if self.use_latent:
@@ -572,6 +616,7 @@ class DiTTrainer:
                 num_workers=args.num_workers,
                 sampler=self.train_sampler,
                 prefetch_factor=args.prefetch_factor,
+                subset_indices=subset_idx,
             )
             val_latent = args.latent_val_lmdb or args.latent_lmdb
             self.val_loader = make_latent_dataloader(
@@ -586,6 +631,7 @@ class DiTTrainer:
                 num_workers=args.num_workers, max_atoms=args.max_atoms,
                 sampler=self.train_sampler,
                 prefetch_factor=args.prefetch_factor,
+                subset_indices=subset_idx,
             )
             self.val_loader = make_dataloader(
                 args.val_lmdb, batch_size=args.batch_size, shuffle=False,
