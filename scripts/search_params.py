@@ -29,6 +29,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows の cp932 コンソールでも Unicode（— や ◀）を出力できるようにする
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except (AttributeError, ValueError):
+    pass
+
 TRAIN_SCRIPT = str(Path(__file__).parent / 'train.py')
 
 # ── デフォルト値 ──────────────────────────────────────────────────────────────
