@@ -147,7 +147,7 @@ ALL_CONFIGS = ARCH_CONFIGS + WEIGHT_CONFIGS
 _BASE_KEYS = frozenset({
     'name', 'train_lmdb', 'val_lmdb', 'base_out_dir',
     'epochs', 'subset_ratio', 'batch_size', 'num_workers',
-    'grad_accum', 'seed', 'val_every', 'group', 'names',
+    'grad_accum', 'seed', 'val_every', 'save_every', 'group', 'names',
     'dry_run', 'skip_existing', 'summarize',
 })
 
@@ -181,7 +181,24 @@ def _read_best_val(log_csv: Path) -> dict | None:
     return best
 
 
-def _build_cmd(cfg: dict, base_args: argparse.Namespace) -> list[str]:
+def _count_epochs(log_csv: Path) -> int:
+    """vae_log.csv に記録済みのエポック数（ヘッダ除く行数）を返す。"""
+    if not log_csv.exists():
+        return 0
+    try:
+        with open(log_csv, encoding='utf-8') as f:
+            return max(0, sum(1 for _ in f) - 1)
+    except Exception:
+        return 0
+
+
+def _latest_ckpt(cfg_dir: Path):
+    """設定ディレクトリ内の最新 periodic チェックポイント（vae_epochNNNN.pt）。"""
+    ckpts = sorted(cfg_dir.glob('vae_epoch*.pt'))   # ゼロ埋めのため辞書順=エポック順
+    return ckpts[-1] if ckpts else None
+
+
+def _build_cmd(cfg: dict, base_args: argparse.Namespace, resume=None) -> list[str]:
     """設定辞書 + base_args から train.py コマンドラインを組み立てる。"""
     name    = cfg['name']
     out_dir = str(Path(base_args.base_out_dir) / name)
@@ -199,8 +216,12 @@ def _build_cmd(cfg: dict, base_args: argparse.Namespace) -> list[str]:
         '--grad_accum',   str(base_args.grad_accum),
         '--seed',         str(base_args.seed),
         '--val_every',    str(base_args.val_every),
-        '--save_every',   str(base_args.epochs + 1),  # 定期保存なし、best のみ
+        '--save_every',   str(base_args.save_every),  # 中断耐性のため定期保存
     ]
+
+    # 中断からの再開（最新チェックポイントを指定）
+    if resume is not None:
+        cmd += ['--resume', str(resume)]
 
     # 設定固有パラメータ（base_args が既に担うキーは除外）
     for k, v in cfg.items():
@@ -253,21 +274,31 @@ def run_search(configs: list[dict], base_args: argparse.Namespace):
 
     for i, cfg in enumerate(configs, 1):
         name    = cfg['name']
-        log_csv = base_out / name / 'vae_log.csv'
+        cfg_dir = base_out / name
+        log_csv = cfg_dir / 'vae_log.csv'
 
         print(f'\n{"="*72}')
         print(f'  [{i}/{total}] {name}')
         print(f'{"="*72}')
 
-        # 既存スキップ
-        if base_args.skip_existing and log_csv.exists():
-            best = _read_best_val(log_csv)
-            if best:
-                print(f'  [SKIP] ログ既存 → val_total={best["val_total"]:.4f}')
-                results.append({'name': name, 'status': 'OK', **best})
-                continue
+        # 完了スキップ / 中断からの自動再開（--skip_existing 時のみ）
+        resume_ckpt = None
+        if base_args.skip_existing:
+            done = _count_epochs(log_csv)
+            if done >= base_args.epochs and done > 0:
+                best = _read_best_val(log_csv)
+                if best:
+                    print(f'  [SKIP] 完了済み ({done} ep) → val_total={best["val_total"]:.4f}')
+                    results.append({'name': name, 'status': 'OK', **best})
+                    continue
+            elif done > 0:
+                resume_ckpt = _latest_ckpt(cfg_dir)
+                if resume_ckpt is not None:
+                    print(f'  [RESUME] {done} ep 済 → {resume_ckpt.name} から再開')
+                else:
+                    print(f'  [RESTART] {done} ep 済だが checkpoint なし → 最初から')
 
-        cmd = _build_cmd(cfg, base_args)
+        cmd = _build_cmd(cfg, base_args, resume=resume_ckpt)
         print('  $ ' + ' '.join(cmd[2:]))  # python + script は省略
 
         if base_args.dry_run:
@@ -325,6 +356,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--seed',          type=int, default=42)
     p.add_argument('--val_every',     type=int, default=5,
                    help='val 実行間隔（エポック）')
+    p.add_argument('--save_every',    type=int, default=5,
+                   help='periodic チェックポイント保存間隔（エポック）。'
+                        '中断からの自動再開に使う。最新1個 + best のみ保持')
     p.add_argument('--group', choices=['arch', 'weights', 'all'], default='arch',
                    help='実行グループ: arch（アーキテクチャ）/ weights（Loss重み）/ all')
     p.add_argument('--names', type=str, default=None,

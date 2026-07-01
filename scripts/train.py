@@ -159,8 +159,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--w_angle', type=float, default=0.5)
     p.add_argument('--w_dihedral', type=float, default=0.1)
     p.add_argument('--pos_loss_type', type=str, default='kabsch',
-                   choices=['kabsch', 'distmat'],
-                   help='座標損失の種類: kabsch（Kabsch RMSD）または distmat（距離行列 MSE）')
+                   choices=['kabsch', 'distmat', 'local_distmat'],
+                   help='座標損失の種類: kabsch（Kabsch RMSD）/ distmat（距離行列 MSE）/ '
+                        'local_distmat（近接ペアのみ、大域折り畳みに頑健）')
+    p.add_argument('--local_cutoff', type=float, default=5.0,
+                   help='local_distmat の近接ペア閾値（Å）')
 
     # DiT
     p.add_argument('--dit_hidden_dim', type=int, default=256)
@@ -340,7 +343,9 @@ class VAETrainer:
         }
         torch.save(ckpt, self.out_dir / f'vae_epoch{epoch:04d}.pt')
         if epoch > self.args.save_every:
-            os.remove(self.out_dir / f'vae_epoch{epoch-self.args.save_every:04d}.pt')
+            old = self.out_dir / f'vae_epoch{epoch-self.args.save_every:04d}.pt'
+            if old.exists():   # resume 境界で存在しない場合があるためガード
+                os.remove(old)
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
             torch.save(ckpt, self.out_dir / 'vae_best.pt')
@@ -394,6 +399,7 @@ class VAETrainer:
                             triplets=getattr(batch, 'triplets', None),
                             quartets=getattr(batch, 'quartets', None),
                             pos_loss_type=self.args.pos_loss_type,
+                            local_cutoff=self.args.local_cutoff,
                             batch=batch.batch,
                         )
 
@@ -921,6 +927,7 @@ def _benchmark_vae(trainer: VAETrainer, n_batches: int):
                 triplets=getattr(batch, 'triplets', None),
                 quartets=getattr(batch, 'quartets', None),
                 pos_loss_type=trainer.args.pos_loss_type,
+                local_cutoff=trainer.args.local_cutoff,
                 batch=batch.batch,
             )
         if use_cuda:

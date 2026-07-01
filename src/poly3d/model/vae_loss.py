@@ -25,7 +25,7 @@ from torch import Tensor
 from poly3d.model.geo_losses import (
     angle_loss, dihedral_loss,
     build_angle_triplets, build_dihedral_quartets,
-    kabsch_rmsd_loss, dist_matrix_loss,
+    kabsch_rmsd_loss, dist_matrix_loss, local_distance_loss,
 )
 
 
@@ -55,8 +55,13 @@ def vae_loss(
     # 事前計算済みトポロジー（None の場合はここで計算）
     triplets: Optional[Tensor] = None,
     quartets: Optional[Tensor] = None,
-    # 座標損失の種類: 'kabsch'（回転不変 RMSD）または 'distmat'（距離行列 MSE）
-    pos_loss_type: Literal['kabsch', 'distmat'] = 'kabsch',
+    # 座標損失の種類:
+    #   'kabsch'        : Kabsch RMSD（回転不変、大域構造も評価）
+    #   'distmat'       : 全ペア距離行列 MSE（回転不変）
+    #   'local_distmat' : 近接ペア（GT < local_cutoff Å）のみの距離 MSE
+    #                     大域的な折り畳みに頑健
+    pos_loss_type: Literal['kabsch', 'distmat', 'local_distmat'] = 'kabsch',
+    local_cutoff: float = 5.0,
     batch: Optional[Tensor] = None,
 ) -> Tuple[Tensor, dict]:
     """
@@ -83,6 +88,8 @@ def vae_loss(
     # 座標損失（回転・並進不変）
     if pos_loss_type == 'distmat':
         l_pos = dist_matrix_loss(pos_pred, pos_gt, batch)
+    elif pos_loss_type == 'local_distmat':
+        l_pos = local_distance_loss(pos_pred, pos_gt, batch, cutoff=local_cutoff)
     else:
         l_pos = kabsch_rmsd_loss(pos_pred, pos_gt, batch)
 
