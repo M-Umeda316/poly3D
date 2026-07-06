@@ -125,9 +125,13 @@ class EGNNLayer(nn.Module):
             ).float().clamp(min=1.0).unsqueeze(-1)  # (N, 1)
             coord_delta = coord_delta / n_neighbors
 
-        # scatter 後に再クランプ（diff * coord_w の積が大きい場合に備える）
+        # scatter 後にノードごとのベクトルノルムでスケールダウン
+        # （成分ごと clamp は回転同変性を破壊するため使用不可。
+        #  一様スケール R(αv)=αR(v) はベクトルに対して回転同変。）
         if self.coord_clamp > 0:
-            coord_delta = coord_delta.clamp(-self.coord_clamp, self.coord_clamp)
+            norm = coord_delta.norm(dim=-1, keepdim=True)        # (N, 1)
+            scale = (self.coord_clamp / norm.clamp(min=1e-8)).clamp(max=1.0)
+            coord_delta = coord_delta * scale
 
         x_new = x + coord_delta                     # (N, 3)
 

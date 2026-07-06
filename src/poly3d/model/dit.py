@@ -8,7 +8,7 @@ Latent Diffusion Transformer (DiT)
   - グラフ距離ベースの positional biased attention
   - Self-conditioning (p=0.5 で前回の予測を入力に)
   - 条件付け Ci を concat して入力
-  - **batch 内の分子間 attention を block-diagonal mask で遮断**
+  - **batch 内の分子間 attention を block-diagonal（分子内限定）に構造的に遮断**
 
 入力:
   Zt    : (N, latent_dim)  ノイズ付き潜在変数
@@ -16,13 +16,18 @@ Latent Diffusion Transformer (DiT)
   t     : (B,) float       時刻
   batch : (N,) int         各ノードのバッチ番号
   z_sc  : (N, latent_dim) self-conditioning（None → ゼロ）
-  attn_bias : (H, N, N) float  precompute_attn_inputs() の出力（省略時は内部計算）
+  attn_bias : precompute_attn_inputs() の出力（パディング形式コンテキスト、省略時は内部計算）
 
 出力:
   z1_pred : (N, latent_dim)  Z1 の予測（velocity）
 
 パフォーマンスメモ:
-  attn_bias は BFS（CPU Python）を含むため計算コストが高い。
+  従来は全分子を長さ N の 1 シーケンスに連結し (H, N, N) の密 attention を計算していたため、
+  計算・メモリが (Σnᵢ)² に膨れていた。本実装は分子ごとにパディングした (B, max_n, hidden) で
+  attention を計算するため O(B·max_n²) に削減される（分子間 attention は別バッチ要素として
+  構造的に遮断され、-1e9 の明示マスクは padding key のみに限定される）。
+
+  attn_bias（グラフ距離 BFS）は CPU Python を含むため計算コストが高い。
   FlowMatching.loss / sample から precompute_attn_inputs() を 1 バッチ 1 回だけ
   呼び出し、その結果を attn_bias として渡すこと（学習時 2× 削減、サンプリング時 100× 削減）。
 """
@@ -54,56 +59,21 @@ class SinusoidalTimeEmbedding(nn.Module):
         return torch.cat([args.sin(), args.cos()], dim=-1)
 
 
-def _build_block_diagonal_mask(batch: Tensor) -> Tensor:
-    """batch (N,) → (N, N) bool mask。同じ分子内のノードペアのみ True。"""
-    return batch.unsqueeze(0) == batch.unsqueeze(1)   # (N, N)
-
-
-def _build_batch_pos_bias(
-    edge_index: Tensor, batch: Tensor, num_nodes: int,
-    bias_module: GraphDistanceBias,
-) -> Tensor:
-    """
-    バッチ内の各分子ごとにグラフ距離 → one-hot → bias を計算し、
-    block-diagonal な (N, N, n_heads) テンソルに詰める。
-    異なる分子間は 0（attn_bias で -1e9 に上書きされるので問題ない）。
-    """
-    device = edge_index.device
-    B = int(batch.max().item()) + 1
-    n_heads = bias_module.n_heads
-    bias = torch.zeros(num_nodes, num_nodes, n_heads, device=device)
-
-    for b in range(B):
-        node_mask = (batch == b)
-        node_indices = node_mask.nonzero(as_tuple=True)[0]
-        n_b = node_indices.size(0)
-        if n_b == 0:
-            continue
-
-        offset = node_indices[0].item()
-        src, dst = edge_index
-        edge_mask = node_mask[src] & node_mask[dst]
-        local_ei = edge_index[:, edge_mask] - offset   # (2, E_b)
-
-        dist_mat = compute_graph_distance(local_ei, n_b)
-        oh = dist_to_onehot(dist_mat)                  # (n_b, n_b, 5)
-        local_bias = bias_module(oh)                    # (n_b, n_b, n_heads)
-
-        idx = node_indices
-        bias[idx.unsqueeze(1), idx.unsqueeze(0)] = local_bias
-
-    return bias   # (N, N, n_heads)
-
-
 class DiTBlock(nn.Module):
     """
     1 層の DiT ブロック。
 
     Pre-LN → F.scaled_dot_product_attention (Flash Attention) → FFN
 
-    attn_bias は (H, N, N) float。
-    - 同分子内: pos_bias 値（use_pos_bias=False なら 0）
-    - 異分子間: -1e9（softmax で実質ゼロになりクロス分子 attention を遮断）
+    attn_ctx は precompute_attn_inputs() が返すパディング形式のコンテキスト dict:
+      - 'gather_idx' : (B, max_n) long   各 (mol, local_pos) → flat ノード index
+      - 'pad_mask'   : (B, max_n) bool   有効ノード = True
+      - 'attn_mask'  : (B, H, max_n, max_n) もしくは (B, 1, 1, max_n) float
+                       同分子内 = pos_bias 値（use_pos_bias=False なら 0）、
+                       padding key = -1e9（softmax で実質ゼロ）
+
+    分子間はそれぞれ別のバッチ要素として扱われるため、cross-molecule attention は
+    構造的に発生しない（明示的な -1e9 マスクは padding key のみ）。
     """
 
     def __init__(
@@ -138,32 +108,53 @@ class DiTBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        attn_bias: Optional[Tensor] = None,   # (H, N, N) float
+        attn_ctx: Optional[dict] = None,
     ) -> Tensor:
         """
-        x         : (N, hidden_dim)
-        attn_bias : (H, N, N) float — pos_bias + block-diagonal mask を統合済み
+        x        : (N, hidden_dim)
+        attn_ctx : precompute_attn_inputs() の戻り値（パディング形式）。
+                   None の場合は全ノードを 1 分子とみなした密 attention（後方互換）。
         """
         N = x.size(0)
         h = self.norm1(x)
         qkv = self.qkv(h).reshape(N, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=1)   # (N, H, D)
 
-        # F.scaled_dot_product_attention: (B, H, N, D) 形式に変換
-        q = q.permute(1, 0, 2).unsqueeze(0)   # (1, H, N, D)
-        k = k.permute(1, 0, 2).unsqueeze(0)
-        v = v.permute(1, 0, 2).unsqueeze(0)
+        if attn_ctx is None:
+            # フォールバック: 全ノードを 1 分子として密 attention
+            q = q.permute(1, 0, 2).unsqueeze(0)   # (1, H, N, D)
+            k = k.permute(1, 0, 2).unsqueeze(0)
+            v = v.permute(1, 0, 2).unsqueeze(0)
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout if self.training else 0.0,
+            )   # (1, H, N, D)
+            out = out.squeeze(0).permute(1, 0, 2).reshape(N, self.hidden_dim)
+        else:
+            gather_idx = attn_ctx['gather_idx']   # (B, max_n)
+            pad_mask = attn_ctx['pad_mask']       # (B, max_n)
+            attn_mask = attn_ctx['attn_mask']     # (B, H, max_n, max_n) or (B, 1, 1, max_n)
+            B, max_n = gather_idx.shape
 
-        # attn_bias: (H, N, N) → (1, H, N, N)
-        sdpa_mask = attn_bias.unsqueeze(0) if attn_bias is not None else None
+            # flat (N, H, D) → padded (B, max_n, H, D) → (B, H, max_n, D)
+            # padding スロットは gather_idx=0（node 0）を指すが、query 行は破棄され、
+            # key/value 列は attn_mask の -1e9 で無効化されるため汚染しない。
+            qp = q[gather_idx].permute(0, 2, 1, 3)   # (B, H, max_n, D)
+            kp = k[gather_idx].permute(0, 2, 1, 3)
+            vp = v[gather_idx].permute(0, 2, 1, 3)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=sdpa_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-        )   # (1, H, N, D)
+            out = F.scaled_dot_product_attention(
+                qp, kp, vp,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+            )   # (B, H, max_n, D)
 
-        out = out.squeeze(0).permute(1, 0, 2).reshape(N, self.hidden_dim)
+            out = out.permute(0, 2, 1, 3).reshape(B, max_n, self.hidden_dim)   # (B, max_n, hidden)
+            # padded → flat (N, hidden) に戻す
+            result = torch.zeros(N, self.hidden_dim, device=x.device, dtype=out.dtype)
+            result[gather_idx[pad_mask]] = out[pad_mask]
+            out = result
+
         x = x + self.out_proj(out)
         x = x + self.ffn(self.norm2(x))
         return x
@@ -174,7 +165,7 @@ class LatentDiT(nn.Module):
     Latent Diffusion Transformer。
 
     PyG Batch のフラットなノード列を受け取り、
-    batch テンソルに基づいて block-diagonal attention を適用する。
+    batch テンソルに基づいて分子ごとにパディングした block-diagonal attention を適用する。
 
     Parameters
     ----------
@@ -243,13 +234,20 @@ class LatentDiT(nn.Module):
         batch: Tensor,
         num_nodes: int,
         dist_mat: Optional[Tensor] = None,
-    ) -> Tensor:
+    ) -> dict:
         """
-        グラフ距離 BFS とブロック対角マスクを 1 回計算し、
-        DiTBlock に渡す (H, N, N) float の combined attention bias を返す。
+        分子ごとにパディングした attention コンテキストを 1 回計算して返す。
 
-          同分子内  : pos_bias 値 (use_pos_bias=False なら 0)
-          異分子間  : -1e9  (softmax で実質ゼロ → cross-molecule attention を遮断)
+        戻り値 dict:
+          'gather_idx' : (B, max_n) long   各 (mol, local_pos) → flat ノード index
+                         （padding スロットは 0）
+          'pad_mask'   : (B, max_n) bool   有効ノード = True
+          'attn_mask'  : (B, H, max_n, max_n) もしくは (B, 1, 1, max_n) float
+                         同分子内  : pos_bias 値（use_pos_bias=False なら 0）
+                         padding key: -1e9（softmax で実質ゼロ）
+
+        分子間は別のバッチ要素として構造的に遮断されるため、cross-molecule の
+        -1e9 マスクは不要（padding key のみに限定）。
 
         Parameters
         ----------
@@ -259,28 +257,72 @@ class LatentDiT(nn.Module):
             None の場合はオンザフライで BFS 計算（低速パス）。
         """
         device = batch.device
-        attn_mask = _build_block_diagonal_mask(batch)   # (N, N) bool
+        H = self.n_heads
+
+        if batch.numel() > 0:
+            B = int(batch.max().item()) + 1
+        else:
+            B = 1
+
+        # 各分子のノード index リスト（flat）
+        node_lists = [(batch == b).nonzero(as_tuple=True)[0] for b in range(B)]
+        counts = [nl.size(0) for nl in node_lists]
+        max_n = max(counts) if counts else 0
+        max_n = max(max_n, 1)
+
+        gather_idx = torch.zeros(B, max_n, dtype=torch.long, device=device)
+        pad_mask = torch.zeros(B, max_n, dtype=torch.bool, device=device)
+        for b, nl in enumerate(node_lists):
+            n_b = nl.size(0)
+            if n_b > 0:
+                gather_idx[b, :n_b] = nl
+                pad_mask[b, :n_b] = True
+
+        # padding key を無効化するバイアス: (B, max_n) → 有効=0, padding=-1e9
+        pad_bias = torch.zeros(B, max_n, device=device).masked_fill(~pad_mask, -1e9)
 
         if self.pos_bias is not None:
+            pos_bias_pad = torch.zeros(B, H, max_n, max_n, device=device)
             if dist_mat is not None:
-                # 高速パス: ワーカーで事前計算済みの距離行列を使用（BFS スキップ）
-                oh = dist_to_onehot(dist_mat.long().to(device))       # (N, N, 5)
-                pos_bias_val = self.pos_bias(oh)                       # (N, N, H)
-                combined = pos_bias_val.permute(2, 0, 1).contiguous() # (H, N, N)
+                # 高速パス: 事前計算済み距離行列から分子ブロックを切り出す
+                dm = dist_mat.long().to(device)
+                for b, nl in enumerate(node_lists):
+                    n_b = nl.size(0)
+                    if n_b == 0:
+                        continue
+                    sub = dm[nl][:, nl]                  # (n_b, n_b)
+                    oh = dist_to_onehot(sub)             # (n_b, n_b, 5)
+                    lb = self.pos_bias(oh)               # (n_b, n_b, H)
+                    pos_bias_pad[b, :, :n_b, :n_b] = lb.permute(2, 0, 1)
             elif edge_index is not None:
-                # 低速パス: オンザフライ BFS（dist_mat 未提供時の後方互換）
-                pos_bias_val = _build_batch_pos_bias(
-                    edge_index, batch, num_nodes, self.pos_bias
-                )                                                       # (N, N, H)
-                combined = pos_bias_val.permute(2, 0, 1).contiguous()  # (H, N, N)
-            else:
-                combined = torch.zeros(self.n_heads, num_nodes, num_nodes, device=device)
+                # 低速パス: 分子ごとにオンザフライ BFS
+                src, dst = edge_index
+                for b, nl in enumerate(node_lists):
+                    n_b = nl.size(0)
+                    if n_b == 0:
+                        continue
+                    node_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+                    node_mask[nl] = True
+                    edge_mask = node_mask[src] & node_mask[dst]
+                    # global ノード index → local (0..n_b-1) に remap
+                    remap = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+                    remap[nl] = torch.arange(n_b, device=device)
+                    local_ei = remap[edge_index[:, edge_mask]]   # (2, E_b)
+                    dist_mat_b = compute_graph_distance(local_ei, n_b)
+                    oh = dist_to_onehot(dist_mat_b)
+                    lb = self.pos_bias(oh)
+                    pos_bias_pad[b, :, :n_b, :n_b] = lb.permute(2, 0, 1)
+            # pos_bias + padding マスクを統合
+            attn_mask = pos_bias_pad + pad_bias.view(B, 1, 1, max_n)
         else:
-            combined = torch.zeros(self.n_heads, num_nodes, num_nodes, device=device)
+            # pos_bias 無し: padding key マスクのみ（ヘッド・query 方向へブロードキャスト）
+            attn_mask = pad_bias.view(B, 1, 1, max_n)
 
-        # 異分子間を -1e9 でマスク
-        combined = combined.masked_fill(~attn_mask.unsqueeze(0), -1e9)
-        return combined   # (H, N, N) float
+        return {
+            'gather_idx': gather_idx,
+            'pad_mask': pad_mask,
+            'attn_mask': attn_mask,
+        }
 
     def forward(
         self,
@@ -290,7 +332,7 @@ class LatentDiT(nn.Module):
         batch: Tensor,         # (N,) int
         edge_index: Optional[Tensor] = None,   # pos_bias 計算用（attn_bias 未提供時のみ使用）
         z_sc: Optional[Tensor] = None,         # self-conditioning
-        attn_bias: Optional[Tensor] = None,    # (H, N, N) precomputed — 毎回計算を避けるため
+        attn_bias: Optional[dict] = None,      # precomputed attention context（毎回計算を避けるため）
     ) -> Tensor:
         """
         Returns
