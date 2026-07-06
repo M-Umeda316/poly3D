@@ -7,6 +7,16 @@
     - triplets  : 結合角トリプレット (T, 3) int64  — VAE angle_loss 用
     - quartets  : 二面角カルテット (Q, 4) int64  — VAE dihedral_loss 用
 
+  これらは edge_index のみに依存する不変値（学習で同一分子を毎エポック
+  再読み込みしても結果は変わらない）。以下の 2 段構えで再計算を減らす:
+    1. build_dataset.py が事前計算済みの値を pickle に含めていれば、
+       それをそのまま使う（前処理を再実行させない後方互換フォールバック）。
+    2. 含まれていない場合（既存の旧形式 lmdb）は計算し、ワーカーローカルの
+       LRU キャッシュ（idx → テンソル）に格納する。DataLoader は
+       persistent_workers=True で動作するため、このキャッシュは
+       エポックをまたいで有効であり、2 エポック目以降は同一 idx の
+       再計算をスキップできる。
+
   collate_fn でノードオフセットを付与してバッチ内でインデックスを統合。
   学習ループは build_angle_triplets / build_dihedral_quartets を呼ばない。
 """
@@ -14,6 +24,7 @@ from __future__ import annotations
 
 import os
 import pickle
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -33,10 +44,18 @@ class ConformerDataset(Dataset):
         lmdb_path: str | Path,
         max_atoms: Optional[int] = None,
         precompute_topology: bool = True,
+        topology_cache_size: int = 4096,
     ):
         self.lmdb_path = str(lmdb_path)
         self.max_atoms = max_atoms
         self.precompute_topology = precompute_topology
+        # idx → (dist_mat, triplets, quartets) のワーカーローカル LRU キャッシュ。
+        # persistent_workers=True 環境ではエポックをまたいで生存するため、
+        # 2 エポック目以降は同一 idx の再計算をスキップできる。
+        # サイズ上限を設けデータセット全体をメモリに載せないようにする
+        # （0 以下でキャッシュ無効化）。
+        self.topology_cache_size = topology_cache_size
+        self._topo_cache: 'OrderedDict[int, tuple]' = OrderedDict()
         self._env: Optional[lmdb.Environment] = None
 
         env = self._open_env()
@@ -91,18 +110,54 @@ class ConformerDataset(Dataset):
             kwargs['lappe'] = torch.from_numpy(d['lappe'])
 
         if self.precompute_topology:
-            # ── ワーカープロセスで事前計算（GPU スレッドと並列実行）────────────
-            # グラフ距離行列: int8 で省メモリ（値域 0-4）
-            kwargs['dist_mat'] = compute_graph_distance(
-                edge_index_t, n, max_dist=4
-            ).to(torch.int8)
-
-            # 結合角トリプレット・二面角カルテット（トポロジーのみ依存）
-            # 単分子（N~50）なので Python ループも十分高速
-            kwargs['triplets'] = build_angle_triplets(edge_index_t, n)    # (T, 3)
-            kwargs['quartets'] = build_dihedral_quartets(edge_index_t, n) # (Q, 4)
+            dist_mat, triplets, quartets = self._get_topology(idx, d, edge_index_t, n)
+            kwargs['dist_mat'] = dist_mat
+            kwargs['triplets'] = triplets
+            kwargs['quartets'] = quartets
 
         return Data(**kwargs)
+
+    def _get_topology(
+        self, idx: int, d: dict, edge_index_t: torch.Tensor, n: int
+    ) -> tuple:
+        """
+        dist_mat / triplets / quartets を取得する。
+
+        優先順位:
+          1. pickle 内に事前計算済みの値があればそれを使う
+             （build_dataset.py --precompute_topology 済みの新形式 lmdb）。
+          2. ワーカーローカル LRU キャッシュに hit したらそれを使う
+             （persistent_workers=True 前提でエポックをまたいで有効）。
+          3. どちらも無ければ計算し、キャッシュに格納する
+             （既存の旧形式 lmdb はこの経路のまま従来どおり動作する）。
+        """
+        if 'dist_mat' in d and 'triplets' in d and 'quartets' in d:
+            dist_mat = torch.from_numpy(d['dist_mat']).to(torch.int8)
+            triplets = torch.from_numpy(d['triplets'].astype(np.int64))
+            quartets = torch.from_numpy(d['quartets'].astype(np.int64))
+            return dist_mat, triplets, quartets
+
+        if self.topology_cache_size > 0 and idx in self._topo_cache:
+            self._topo_cache.move_to_end(idx)
+            dist_mat, triplets, quartets = self._topo_cache[idx]
+            return dist_mat.clone(), triplets.clone(), quartets.clone()
+
+        # ── ワーカープロセスで計算（GPU スレッドと並列実行）────────────────
+        # グラフ距離行列: int8 で省メモリ（値域 0-4）
+        dist_mat = compute_graph_distance(edge_index_t, n, max_dist=4).to(torch.int8)
+
+        # 結合角トリプレット・二面角カルテット（トポロジーのみ依存）
+        # 単分子（N~50）なので Python ループも十分高速
+        triplets = build_angle_triplets(edge_index_t, n)    # (T, 3)
+        quartets = build_dihedral_quartets(edge_index_t, n) # (Q, 4)
+
+        if self.topology_cache_size > 0:
+            self._topo_cache[idx] = (dist_mat, triplets, quartets)
+            self._topo_cache.move_to_end(idx)
+            if len(self._topo_cache) > self.topology_cache_size:
+                self._topo_cache.popitem(last=False)
+
+        return dist_mat, triplets, quartets
 
     def close(self) -> None:
         if self._env is not None:

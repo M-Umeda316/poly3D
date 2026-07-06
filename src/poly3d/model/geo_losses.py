@@ -15,8 +15,9 @@ concat することで、学習ループの GPU ホットパスから除去す�
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from torch_scatter import scatter, scatter_mean
 
@@ -69,13 +70,17 @@ def build_angle_triplets(edge_index: Tensor, num_nodes: int) -> Tensor:
     edge_index (2, E) から 3原子トリプレット (i, j, k) を構築。
     j を中心とする i-j-k ペア（i ≠ k）。
 
+    θ(i,j,k) == θ(k,j,i) のため、i < k の片方向のみを残して重複計算を半減
+    させている（angle_loss の平均値は不変: 値が等しい重複ペアを除いても
+    単純平均・scatter_mean のいずれも同じ平均値になる）。
+
     完全ベクトル化実装: Python ループなし。
     可変長 arange 生成のため .item() を 1 回使用するが、
     DataLoader ワーカー（CPU）上で呼ぶため GPU-CPU 同期コストなし。
 
     Returns
     -------
-    triplets : (T, 3) int64  [i, j, k]
+    triplets : (T, 3) int64  [i, j, k]  (i < k の片方向のみ)
     """
     src, dst = edge_index
     device = edge_index.device
@@ -133,7 +138,10 @@ def build_angle_triplets(edge_index: Tensor, num_nodes: int) -> Tensor:
     j_nodes = v_j[g_pair]
     k_nodes = src_s[g_start + lb]
 
-    return torch.stack([i_nodes, j_nodes, k_nodes], dim=1)
+    # i < k の片方向のみ残す（i == k は既にフィルタ済み。θ(i,j,k)=θ(k,j,i) の
+    # 重複を排除し計算量を半減させる）
+    keep = i_nodes < k_nodes
+    return torch.stack([i_nodes[keep], j_nodes[keep], k_nodes[keep]], dim=1)
 
 
 def build_dihedral_quartets(edge_index: Tensor, num_nodes: int) -> Tensor:
@@ -236,12 +244,21 @@ def build_dihedral_quartets(edge_index: Tensor, num_nodes: int) -> Tensor:
     ], dim=1)
 
 
-def angle_loss(pos_pred: Tensor, pos_gt: Tensor, triplets: Tensor) -> Tensor:
+def angle_loss(
+    pos_pred: Tensor,
+    pos_gt: Tensor,
+    triplets: Tensor,
+    batch: Optional[Tensor] = None,
+) -> Tensor:
     """
     Parameters
     ----------
     pos_pred, pos_gt : (N, 3)
     triplets         : (T, 3) int64 [i, j, k]
+    batch            : (N,) int  分子インデックス。指定時は「トリプレットごとの
+                       二乗誤差 → 中心原子 j の所属分子で scatter_mean → 分子間 mean」
+                       の 2 段階正規化を行う（座標損失と同じ正規化方式）。
+                       None の場合は従来どおり全トリプレット一括 mean。
 
     Returns
     -------
@@ -261,15 +278,30 @@ def angle_loss(pos_pred: Tensor, pos_gt: Tensor, triplets: Tensor) -> Tensor:
         v2_gt = pos_gt[k] - pos_gt[j]
         theta_gt = torch.nan_to_num(_angle_between(v1_gt, v2_gt), nan=0.0)
 
-    return torch.nn.functional.mse_loss(theta_pred, theta_gt)
+    sq_err = (theta_pred - theta_gt).pow(2)   # (T,)
+
+    if batch is None:
+        return sq_err.mean()
+
+    mol_id = batch[j]                          # トリプレットが属する分子（中心原子 j で決定）
+    mol_mse = scatter_mean(sq_err, mol_id, dim=0)
+    return mol_mse.mean()
 
 
-def dihedral_loss(pos_pred: Tensor, pos_gt: Tensor, quartets: Tensor) -> Tensor:
+def dihedral_loss(
+    pos_pred: Tensor,
+    pos_gt: Tensor,
+    quartets: Tensor,
+    batch: Optional[Tensor] = None,
+) -> Tensor:
     """
     Parameters
     ----------
     pos_pred, pos_gt : (N, 3)
     quartets         : (Q, 4) int64 [i, j, k, l]
+    batch            : (N,) int  分子インデックス。指定時は「カルテットごとの
+                       (1 - cos(Δφ)) → 軸原子 j の所属分子で scatter_mean → 分子間 mean」
+                       の 2 段階正規化を行う。None の場合は従来どおり全カルテット一括 mean。
 
     Returns
     -------
@@ -298,7 +330,14 @@ def dihedral_loss(pos_pred: Tensor, pos_gt: Tensor, quartets: Tensor) -> Tensor:
         )
 
     delta = wrap_to_pi(phi_pred - phi_gt)   # (-π, π] に折り返し
-    return (1.0 - torch.cos(delta)).mean()
+    elem_loss = 1.0 - torch.cos(delta)      # (Q,)
+
+    if batch is None:
+        return elem_loss.mean()
+
+    mol_id = batch[j]                        # カルテットが属する分子（軸原子 j で決定）
+    mol_mse = scatter_mean(elem_loss, mol_id, dim=0)
+    return mol_mse.mean()
 
 
 # ── 回転・並進不変な座標損失 ─────────────────────────────────────────────────────
@@ -362,6 +401,59 @@ def kabsch_rmsd_loss(pos_pred: Tensor, pos_gt: Tensor, batch: Tensor) -> Tensor:
     return mol_mse.mean()
 
 
+def _pad_per_molecule(pos_pred: Tensor, pos_gt: Tensor, batch: Tensor):
+    """
+    (N, 3) の pos_pred/pos_gt を分子ごとに 0-パディングして
+    (B, max_n, 3) の密テンソルに変換する。
+
+    `batch.unique()` を用いた Python ループ（分子数 B 回の暗黙的
+    GPU→CPU 同期）を避けるため、分子数 B と最大原子数 max_n を得る
+    2 回の `.item()` 呼び出しのみに同期を限定し、残りは完全にベクトル化する。
+
+    Returns
+    -------
+    padded_pred, padded_gt : (B, max_n, 3)
+    valid_mask             : (B, max_n) bool  パディングでない実原子位置
+    """
+    device = pos_pred.device
+    N = pos_pred.size(0)
+
+    B = int(batch.max().item()) + 1 if N > 0 else 0          # 同期 1 回
+    if B == 0:
+        return (
+            pos_pred.new_zeros((0, 0, 3)),
+            pos_gt.new_zeros((0, 0, 3)),
+            torch.zeros((0, 0), dtype=torch.bool, device=device),
+        )
+
+    # 分子内でのローカル位置（0..count-1）をベクトル化して求める。
+    # batch は必ずしもソート済みでなくても良いよう argsort 経由で計算する。
+    order = torch.argsort(batch, stable=True)
+    batch_sorted = batch[order]
+    counts = torch.bincount(batch_sorted, minlength=B)         # (B,)
+    ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])   # (B+1,)
+    pos_in_sorted = torch.arange(N, device=device) - torch.repeat_interleave(ptr[:-1], counts)
+    local_idx = torch.empty(N, dtype=torch.long, device=device)
+    local_idx[order] = pos_in_sorted
+
+    max_n = int(counts.max().item())                            # 同期 1 回
+
+    flat_idx = batch * max_n + local_idx                        # (N,)
+
+    padded_pred = torch.zeros((B * max_n, 3), dtype=pos_pred.dtype, device=device)
+    padded_pred = padded_pred.scatter(0, flat_idx.unsqueeze(-1).expand(-1, 3), pos_pred)
+    padded_pred = padded_pred.view(B, max_n, 3)
+
+    with torch.no_grad():
+        padded_gt = torch.zeros((B * max_n, 3), dtype=pos_gt.dtype, device=device)
+        padded_gt = padded_gt.scatter(0, flat_idx.unsqueeze(-1).expand(-1, 3), pos_gt)
+        padded_gt = padded_gt.view(B, max_n, 3)
+
+    valid_mask = torch.arange(max_n, device=device).unsqueeze(0) < counts.unsqueeze(1)  # (B, max_n)
+
+    return padded_pred, padded_gt, valid_mask
+
+
 def dist_matrix_loss(pos_pred: Tensor, pos_gt: Tensor, batch: Tensor) -> Tensor:
     """
     全原子ペア距離行列の MSE による回転・並進不変な座標損失。
@@ -371,6 +463,12 @@ def dist_matrix_loss(pos_pred: Tensor, pos_gt: Tensor, batch: Tensor) -> Tensor:
 
     計算量は O(n²) / molecule。大きな分子では kabsch_rmsd_loss の方が
     効率的だが、こちらは SVD なしでシンプルに回転不変性を確保できる。
+
+    分子ごとに `batch.unique()` で Python ループする実装は分子数 B 回の
+    暗黙的 GPU→CPU 同期を引き起こすため、分子を最大原子数へ 0-パディング
+    してから batched cdist で一括計算する（`_pad_per_molecule`）。
+    O(Σn)² の全原子ペア cdist（異分子間ペアも含む）を作らず、
+    O(B · max_n²) のブロック対角相当の計算に抑える。
 
     Parameters
     ----------
@@ -382,21 +480,26 @@ def dist_matrix_loss(pos_pred: Tensor, pos_gt: Tensor, batch: Tensor) -> Tensor:
     -------
     scalar loss  (分子ごとの距離行列 MSE の平均)
     """
+    if pos_pred.size(0) == 0:
+        return pos_pred.new_zeros(())
+
     device_type = pos_pred.device.type if pos_pred.device.type != 'cpu' else 'cpu'
-    losses = []
-    for mol_id in batch.unique():
-        mask = batch == mol_id
-        P = pos_pred[mask]          # (n, 3)
-        Q = pos_gt[mask]            # (n, 3)
+    padded_pred, padded_gt, valid_mask = _pad_per_molecule(pos_pred, pos_gt, batch)  # (B, max_n, 3), (B, max_n)
 
-        # cdist の二乗計算が bf16 で精度劣化するため fp32 を強制
-        with torch.autocast(device_type=device_type, enabled=False):
-            d_pred = torch.cdist(P.float(), P.float())  # (n, n)
-            with torch.no_grad():
-                d_gt = torch.cdist(Q.float(), Q.float())
-            losses.append(F.mse_loss(d_pred, d_gt))
+    valid_pair = valid_mask.unsqueeze(2) & valid_mask.unsqueeze(1)   # (B, max_n, max_n)
 
-    return torch.stack(losses).mean()
+    # cdist の二乗計算が bf16 で精度劣化するため fp32 を強制
+    with torch.autocast(device_type=device_type, enabled=False):
+        d_pred = torch.cdist(padded_pred.float(), padded_pred.float())   # (B, max_n, max_n)
+        with torch.no_grad():
+            d_gt = torch.cdist(padded_gt.float(), padded_gt.float())
+
+        sq_err = (d_pred - d_gt).pow(2) * valid_pair                      # パディング領域は 0
+        mol_sum = sq_err.sum(dim=(1, 2))                                  # (B,)
+        mol_count = valid_mask.sum(dim=1).float().pow(2).clamp(min=1.0)   # n_m² （元実装の n×n 平均に一致）
+        mol_mse = mol_sum / mol_count
+
+    return mol_mse.mean()
 
 
 def local_distance_loss(
@@ -417,6 +520,12 @@ def local_distance_loss(
     という大域折り畳みへの脆弱性を持つが、本損失はその影響を受けない。局所的な
     結合・角度・近接パッキングの再現性を評価・学習するのに適する。
 
+    分子ごとに `batch.unique()` で Python ループする実装は分子数 B 回の
+    暗黙的 GPU→CPU 同期を引き起こすため、分子を最大原子数へ 0-パディング
+    してから batched cdist で一括計算する（`_pad_per_molecule`）。
+    近接ペアが 1 つも無い分子は元実装同様に平均対象から除外する
+    （0 を加算せず、その分子自体をスキップする）。
+
     Parameters
     ----------
     pos_pred : (N, 3)  予測座標
@@ -428,22 +537,28 @@ def local_distance_loss(
     -------
     scalar loss  (分子ごとの近接ペア距離 MSE の平均)
     """
-    device_type = pos_pred.device.type if pos_pred.device.type != 'cpu' else 'cpu'
-    losses = []
-    for mol_id in batch.unique():
-        mask = batch == mol_id
-        P = pos_pred[mask]          # (n, 3)
-        Q = pos_gt[mask]            # (n, 3)
-
-        with torch.autocast(device_type=device_type, enabled=False):
-            d_pred = torch.cdist(P.float(), P.float())      # (n, n)
-            with torch.no_grad():
-                d_gt = torch.cdist(Q.float(), Q.float())
-                # GT で近接する（かつ自己ペアでない）ペアのみを対象
-                local = (d_gt < cutoff) & (d_gt > eps)
-            if local.any():
-                losses.append(F.mse_loss(d_pred[local], d_gt[local]))
-
-    if not losses:
+    if pos_pred.size(0) == 0:
         return pos_pred.new_zeros(())
-    return torch.stack(losses).mean()
+
+    device_type = pos_pred.device.type if pos_pred.device.type != 'cpu' else 'cpu'
+    padded_pred, padded_gt, valid_mask = _pad_per_molecule(pos_pred, pos_gt, batch)  # (B, max_n, 3), (B, max_n)
+
+    valid_pair = valid_mask.unsqueeze(2) & valid_mask.unsqueeze(1)   # (B, max_n, max_n)
+
+    with torch.autocast(device_type=device_type, enabled=False):
+        d_pred = torch.cdist(padded_pred.float(), padded_pred.float())   # (B, max_n, max_n)
+        with torch.no_grad():
+            d_gt = torch.cdist(padded_gt.float(), padded_gt.float())
+            # GT で近接する（かつ自己ペアでない、パディングでない）ペアのみを対象
+            local = valid_pair & (d_gt < cutoff) & (d_gt > eps)
+
+        sq_err = (d_pred - d_gt).pow(2) * local
+        mol_count = local.sum(dim=(1, 2))                 # (B,) 分子ごとの近接ペア数
+        has_local = mol_count > 0
+        if not has_local.any():
+            return pos_pred.new_zeros(())
+
+        mol_sum = sq_err.sum(dim=(1, 2))
+        mol_mse = mol_sum[has_local] / mol_count[has_local].float()
+
+    return mol_mse.mean()

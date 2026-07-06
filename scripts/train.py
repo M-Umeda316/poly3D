@@ -45,7 +45,7 @@ import time
 
 # CUDA アロケータの断片化緩和（torch import より前に設定）
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import Optional
 
@@ -106,8 +106,25 @@ def _unwrap(model: nn.Module) -> nn.Module:
 
 def _all_reduce_dict(d: dict[str, float], n: int, device: torch.device) -> tuple[dict[str, float], int]:
     """
-    各ランクの (sums_dict, n_batches) を全ランクで集計し、
-    グローバル合計を返す。分散モードでなければ入力をそのまま返す。
+    各ランクの (sums_dict, count) を全ランクで集計し、グローバル合計を返す。
+    分散モードでなければ入力をそのまま返す（シングル GPU の挙動を完全維持）。
+
+    ここで d[k] は「各バッチの損失（バッチ内平均）× count(=1) の総和」、
+    n は count の総和（＝処理バッチ数）に相当する。したがって all_reduce SUM 後に
+    呼び出し側で `d[k] / n` とすると、
+
+        Σ_ranks Σ_batches loss_k    sum_of_(loss * count)
+        ─────────────────────────  =  ─────────────────────
+        Σ_ranks (バッチ数)              sum_of_count
+
+    となり、各ランクの処理バッチ数が異なっても正しい加重平均になる（各バッチ重み1）。
+    val を DistributedSampler で分割するとランクごとにバッチ数が変わり得るが、
+    この形（sum_of_(loss*count) と sum_of_count をそれぞれ all_reduce してから割る）
+    なら単一 GPU 時と同じグローバル平均に一致する。
+
+    注意: DistributedSampler は割り切れるようサンプルを重複パディングするため、
+    分割 val ではパディング由来の軽微なバイアスが乗る（drop_last=False のまま許容）。
+    厳密さが必要なら padding 分を除外する集計を別途実装すること。
     """
     if not dist.is_initialized():
         return d, n
@@ -292,9 +309,18 @@ class VAETrainer:
             prefetch_factor=args.prefetch_factor,
             subset_indices=subset_idx,
         )
+        # val も分散時は DistributedSampler で分割（全ランク重複処理の無駄を排除）。
+        # shuffle=False。各ランクのバッチ数差は _all_reduce_dict の加重平均で吸収される。
+        self.val_sampler: Optional[DistributedSampler] = None
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            from poly3d.data.dataset import ConformerDataset
+            _val_ds = ConformerDataset(args.val_lmdb, max_atoms=args.max_atoms)
+            self.val_sampler = DistributedSampler(_val_ds, shuffle=False)
         self.val_loader = make_dataloader(
-            args.val_lmdb, batch_size=args.batch_size, shuffle=False,
+            args.val_lmdb, batch_size=args.batch_size,
+            shuffle=False,
             num_workers=args.num_workers, max_atoms=args.max_atoms,
+            sampler=self.val_sampler,
             prefetch_factor=args.prefetch_factor,
         )
 
@@ -369,9 +395,11 @@ class VAETrainer:
         for step, batch in enumerate(pbar):
             if batch is None:
                 continue
-            batch = batch.to(self.device)
 
             try:
+                # .to(device) も try 内に置く（大きなバッチ転送時の OOM を捕捉して
+                # スキップ・継続できるようにする。外に置くと未捕捉でプロセスが落ちる）
+                batch = batch.to(self.device)
                 with torch.set_grad_enabled(train):
                     with torch.autocast(device_type=self.device.type,
                                         dtype=self.amp_dtype, enabled=self.amp_enabled):
@@ -405,10 +433,20 @@ class VAETrainer:
 
                 if train:
                     # 勾配累積: accum ステップで 1 回最適化
-                    (loss / accum).backward()
-
                     is_last_step = (step + 1 >= n_batches)
-                    if (step + 1) % accum == 0 or is_last_step:
+                    is_accum_step = ((step + 1) % accum == 0) or is_last_step
+                    # accum 中間ステップ（optimizer.step() しない回）は DDP の勾配
+                    # all-reduce を no_sync で抑制し、accum 回分の通信を最終ステップに集約する。
+                    # 最終ステップで一括同期されるため数値は完全に不変（通信最適化のみ）。
+                    # 単一 GPU では生モジュール（no_sync を持たない）→ 何もしない＝挙動不変。
+                    with ExitStack() as stack:
+                        if not is_accum_step:
+                            for m in (self.cond_encoder, self.vae):
+                                if hasattr(m, 'no_sync'):
+                                    stack.enter_context(m.no_sync())
+                        (loss / accum).backward()
+
+                    if is_accum_step:
                         nn.utils.clip_grad_norm_(
                             list(self.cond_encoder.parameters()) + list(self.vae.parameters()),
                             self.args.grad_clip,
@@ -439,6 +477,13 @@ class VAETrainer:
                 except Exception as _ec:
                     if is_main_process():
                         print(f'[OOM] empty_cache も失敗: {_ec} — 次バッチで再試行')
+                # マルチ GPU では、あるランクだけが OOM で continue すると
+                # DDP backward の勾配 all-reduce（コレクティブ通信）が不整合になり、
+                # 他ランクが完了待ちで NCCL ハングする（原因不明のまま停止）。
+                # ハングするより明示的にクラッシュさせる方が安全なので、
+                # メモリ解放後に元例外を re-raise する。シングル GPU では従来通り continue。
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    raise
                 continue
 
             # detach テンソル → float 変換（バッチ末でまとめて sync）
@@ -615,6 +660,10 @@ class DiTTrainer:
                 _ds = Subset(_ds, subset_idx)
             self.train_sampler = DistributedSampler(_ds, shuffle=True, seed=args.seed)
 
+        # val も分散時は DistributedSampler で分割（全ランク重複処理の無駄を排除）。
+        # shuffle=False。各ランクのバッチ数差は _all_reduce_dict の加重平均で吸収される。
+        self.val_sampler: Optional[DistributedSampler] = None
+        _distributed = dist.is_initialized() and dist.get_world_size() > 1
         if self.use_latent:
             self.train_loader = make_latent_dataloader(
                 args.latent_lmdb, batch_size=args.batch_size,
@@ -625,9 +674,14 @@ class DiTTrainer:
                 subset_indices=subset_idx,
             )
             val_latent = args.latent_val_lmdb or args.latent_lmdb
+            if _distributed:
+                from poly3d.data.latent_dataset import LatentDataset
+                self.val_sampler = DistributedSampler(
+                    LatentDataset(val_latent), shuffle=False)
             self.val_loader = make_latent_dataloader(
                 val_latent, batch_size=args.batch_size, shuffle=False,
                 num_workers=args.num_workers,
+                sampler=self.val_sampler,
                 prefetch_factor=args.prefetch_factor,
             )
         else:
@@ -639,9 +693,15 @@ class DiTTrainer:
                 prefetch_factor=args.prefetch_factor,
                 subset_indices=subset_idx,
             )
+            if _distributed:
+                from poly3d.data.dataset import ConformerDataset
+                self.val_sampler = DistributedSampler(
+                    ConformerDataset(args.val_lmdb, max_atoms=args.max_atoms),
+                    shuffle=False)
             self.val_loader = make_dataloader(
                 args.val_lmdb, batch_size=args.batch_size, shuffle=False,
                 num_workers=args.num_workers, max_atoms=args.max_atoms,
+                sampler=self.val_sampler,
                 prefetch_factor=args.prefetch_factor,
             )
 
@@ -705,12 +765,14 @@ class DiTTrainer:
         for step, batch in enumerate(pbar):
             if batch is None:
                 continue
-            batch = batch.to(self.device)
-
-            # dist_mat: ワーカーで事前計算済みのブロック対角距離行列
-            dist_mat = getattr(batch, 'dist_mat', None)
 
             try:
+                # .to(device) も try 内に置く（OOM を捕捉してスキップ・継続するため）
+                batch = batch.to(self.device)
+
+                # dist_mat: ワーカーで事前計算済みのブロック対角距離行列
+                dist_mat = getattr(batch, 'dist_mat', None)
+
                 if self.use_latent:
                     # LatentDataset モード: エンコード済みデータを直接使用
                     z0   = batch.z0      # (N, latent_dim)
@@ -742,10 +804,21 @@ class DiTTrainer:
                         )
 
                 if train:
-                    (loss / accum).backward()
-
                     is_last_step = (step + 1 >= n_batches)
-                    if (step + 1) % accum == 0 or is_last_step:
+                    is_accum_step = ((step + 1) % accum == 0) or is_last_step
+                    # accum 中間ステップ（optimizer.step() しない回）は DDP の勾配
+                    # all-reduce を no_sync で抑制し、accum 回分の通信を最終ステップに集約する。
+                    # DiT stage は flow.model のみ DDP ラップ。最終ステップで一括同期され
+                    # 数値は完全に不変（通信最適化のみ）。単一 GPU では生モジュール
+                    # （no_sync を持たない）→ 何もしない＝挙動不変。
+                    with ExitStack() as stack:
+                        if not is_accum_step:
+                            m = self.flow.model
+                            if hasattr(m, 'no_sync'):
+                                stack.enter_context(m.no_sync())
+                        (loss / accum).backward()
+
+                    if is_accum_step:
                         nn.utils.clip_grad_norm_(self.flow.parameters(), self.args.grad_clip)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
@@ -773,6 +846,13 @@ class DiTTrainer:
                 except Exception as _ec:
                     if is_main_process():
                         print(f'[OOM] empty_cache も失敗: {_ec} — 次バッチで再試行')
+                # マルチ GPU では、あるランクだけが OOM で continue すると
+                # DDP backward の勾配 all-reduce（コレクティブ通信）が不整合になり、
+                # 他ランクが完了待ちで NCCL ハングする（原因不明のまま停止）。
+                # ハングするより明示的にクラッシュさせる方が安全なので、
+                # メモリ解放後に元例外を re-raise する。シングル GPU では従来通り continue。
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    raise
                 continue
 
             for k, v in ld.items():

@@ -218,7 +218,14 @@ class StructuralVAE(nn.Module):
         logvar : (N, latent_dim)
         """
         mu, logvar = self.encoder(cond, pos, edge_index, e_cond, batch)
-        z = self.reparameterize(mu, logvar)
+        # 評価（eval）時は決定論デコード（z = mu）で乱数ノイズを排除し、
+        # val loss のばらつき＝チェックポイント選択ノイズを防ぐ。
+        # 学習（train）時は従来どおり reparameterize で確率的サンプリング。
+        # KL 損失用に mu/logvar は常に返す。
+        if self.training:
+            z = self.reparameterize(mu, logvar)
+        else:
+            z = mu
         return z, mu, logvar
 
     def decode(
@@ -245,6 +252,9 @@ class StructuralVAE(nn.Module):
         pos_pred : (N, 3)
         mu       : (N, latent_dim)
         logvar   : (N, latent_dim)
+
+        eval 時は encode が決定論デコード（z = mu）を返すため、forward も
+        自動的に決定論的になる（同一入力→同一 pos_pred）。train 時は確率的。
         """
         z, mu, logvar = self.encode(cond, pos, edge_index, e_cond, batch)
         pos_pred = self.decode(z, cond, edge_index, e_cond, batch)

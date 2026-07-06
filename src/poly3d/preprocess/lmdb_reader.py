@@ -16,10 +16,16 @@ import numpy as np
 
 
 def _decompress(val: bytes) -> bytes:
-    """zlib 圧縮されていれば展開する。"""
-    if val[:2] in (b'x\x9c', b'x\x01', b'x\xda'):
+    """zlib 圧縮されていれば展開する。
+
+    zlib のヘッダは圧縮レベル・辞書指定によって先頭2バイトが変動する
+    （例: 0x78 0x5e など）ため、特定ヘッダの列挙による判定はやめ、
+    まず zlib.decompress を試して失敗したら非圧縮データとして扱う。
+    """
+    try:
         return zlib.decompress(val)
-    return val
+    except zlib.error:
+        return val
 
 
 def _decode_ndarray(obj) -> np.ndarray | object:
@@ -42,8 +48,17 @@ def count_entries(path: str | Path) -> int:
     return n
 
 
-def iter_lmdb(path: str | Path) -> Generator[dict, None, None]:
-    """lmdb ファイルから生 JSON dict をひとつずつ yield する。"""
+def iter_lmdb(path: str | Path, stats: dict | None = None) -> Generator[dict, None, None]:
+    """lmdb ファイルから生 JSON dict をひとつずつ yield する。
+
+    Parameters
+    ----------
+    stats : dict, optional
+        与えられた場合、無言スキップの件数をカウントして書き込む。
+        - 'decode_error': JSON デコード失敗件数
+        - 'missing_key' : dict でない/必須キー欠落件数
+        呼び出し元はこの辞書を最終ログの集計に利用できる。
+    """
     env = lmdb.open(
         str(path), subdir=False, readonly=True,
         lock=False, readahead=False, meminit=False,
@@ -55,11 +70,17 @@ def iter_lmdb(path: str | Path) -> Generator[dict, None, None]:
             try:
                 obj = json.loads(raw)
             except Exception:
+                if stats is not None:
+                    stats['decode_error'] = stats.get('decode_error', 0) + 1
                 continue
 
             if not isinstance(obj, dict):
+                if stats is not None:
+                    stats['missing_key'] = stats.get('missing_key', 0) + 1
                 continue
             if 'numbers' not in obj or 'positions' not in obj or 'data' not in obj:
+                if stats is not None:
+                    stats['missing_key'] = stats.get('missing_key', 0) + 1
                 continue
 
             yield obj
@@ -80,7 +101,12 @@ def read_molecule(
     sid         : str
     """
     atomic_nums = _decode_ndarray(record['numbers']).flatten().astype(int)
-    positions = _decode_ndarray(record['positions']).reshape(-1, 3)
+    positions = np.asarray(_decode_ndarray(record['positions']), dtype=np.float64).reshape(-1, 3)
+    if positions.shape[0] != atomic_nums.shape[0]:
+        raise ValueError(
+            f'原子数とpositions行数が不一致: numbers={atomic_nums.shape[0]}, '
+            f'positions={positions.shape[0]}'
+        )
     charge = int(record['data'].get('charge', 0))
     sid = str(record['data'].get('sid', ''))
     return atomic_nums, positions, charge, sid

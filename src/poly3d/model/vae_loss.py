@@ -21,6 +21,7 @@ from typing import Literal, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch_scatter import scatter_mean
 
 from poly3d.model.geo_losses import (
     angle_loss, dihedral_loss,
@@ -29,15 +30,36 @@ from poly3d.model.geo_losses import (
 )
 
 
-def bond_length_loss(pos_pred: Tensor, pos_gt: Tensor, edge_index: Tensor) -> Tensor:
-    """結合で繋がった原子ペアの距離 MSE"""
+def bond_length_loss(
+    pos_pred: Tensor,
+    pos_gt: Tensor,
+    edge_index: Tensor,
+    batch: Optional[Tensor] = None,
+) -> Tensor:
+    """
+    結合で繋がった原子ペアの距離 MSE。
+
+    batch を指定すると、「エッジごとの二乗誤差 → エッジ端点（src）の
+    所属分子で scatter_mean → 分子間 mean」の 2 段階正規化を行う
+    （座標損失と同じ正規化方式）。エッジは分子内のみに存在するため
+    src / dst どちらの batch を使っても結果は同じ。
+    batch が None の場合は従来どおり全エッジ一括 mean（後方互換）。
+    """
     if edge_index.size(1) == 0:
         return pos_pred.new_zeros(())
     src, dst = edge_index
     d_pred = (pos_pred[src] - pos_pred[dst]).norm(dim=-1)
     with torch.no_grad():
         d_gt = (pos_gt[src] - pos_gt[dst]).norm(dim=-1)
-    return F.mse_loss(d_pred, d_gt)
+
+    sq_err = (d_pred - d_gt).pow(2)   # (E,)
+
+    if batch is None:
+        return sq_err.mean()
+
+    mol_id = batch[src]
+    mol_mse = scatter_mean(sq_err, mol_id, dim=0)
+    return mol_mse.mean()
 
 
 def vae_loss(
@@ -94,17 +116,17 @@ def vae_loss(
         l_pos = kabsch_rmsd_loss(pos_pred, pos_gt, batch)
 
     # 結合長
-    l_bond = bond_length_loss(pos_pred, pos_gt, edge_index)
+    l_bond = bond_length_loss(pos_pred, pos_gt, edge_index, batch)
 
     # 結合角
     if triplets is None:
         triplets = build_angle_triplets(edge_index, num_nodes)
-    l_angle = angle_loss(pos_pred, pos_gt, triplets)
+    l_angle = angle_loss(pos_pred, pos_gt, triplets, batch)
 
     # 二面角
     if quartets is None:
         quartets = build_dihedral_quartets(edge_index, num_nodes)
-    l_dihedral = dihedral_loss(pos_pred, pos_gt, quartets)
+    l_dihedral = dihedral_loss(pos_pred, pos_gt, quartets, batch)
 
     # KL（logvar は VAEEncoder で clamp 済みだが念のため再 clamp）
     logvar_safe = logvar.clamp(-10.0, 10.0)

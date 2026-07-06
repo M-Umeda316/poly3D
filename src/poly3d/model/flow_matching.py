@@ -10,7 +10,7 @@ Flow Matching スケジューラ + 損失
 
 サンプリング: Euler ODE
   dZ/dt = (Z1_pred - Zt) / (1 - t)
-  Zt-dt = Zt - dt * (Zt - Z1_pred) / (1 - t)
+  Zt-dt = Zt + dt * (Zt - Z1_pred) / (1 - t)
 
 パフォーマンスメモ:
   attn_bias（グラフ距離 BFS）は loss() / sample() の先頭で 1 回だけ計算し、
@@ -141,8 +141,12 @@ class FlowMatching(nn.Module):
         # BFS は ODE ループ外で 1 回だけ
         attn_bias = raw.precompute_attn_inputs(edge_index, batch, n_atoms, dist_mat=dist_mat)
 
-        # t: 1.0 → 0.0
-        ts = torch.linspace(1.0, 0.0, n_steps + 1, device=device)
+        # t: t_max → 0.0
+        # 学習は t ~ U(0, t_max) しかカバーせず t∈[t_max, 1.0] は未学習領域。
+        # 初期ノイズ zt を「t=t_max の状態」とみなして t_max から積分することで
+        # 未学習領域を避け、かつ初回 denom=1-t_max（例: 0.1）でゼロ割暴発も防ぐ。
+        # 生成品質が不足する場合は代替として学習側 t_max を 1.0 に上げる設計判断もあり得る。
+        ts = torch.linspace(self.t_max, 0.0, n_steps + 1, device=device)
 
         z_sc = None   # self-conditioning: 前ステップの予測
         for i in range(n_steps):
@@ -153,8 +157,8 @@ class FlowMatching(nn.Module):
             z1_pred = raw(zt, cond, t, batch, z_sc=z_sc, attn_bias=attn_bias)
             z_sc = z1_pred   # 次ステップ用に保存
 
-            # Euler step: Zt_{t-dt} = Zt - dt * (Zt - Z1_pred) / (1 - t)
+            # Euler step: Zt_{t-dt} = Zt + dt * (Zt - Z1_pred) / (1 - t)
             denom = (1.0 - t_val).clamp(min=1e-4)
-            zt = zt - dt * (zt - z1_pred) / denom
+            zt = zt + dt * (zt - z1_pred) / denom
 
         return zt

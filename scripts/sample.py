@@ -29,6 +29,7 @@ from poly3d.model.builder import build_cond_encoder, build_vae, build_dit
 from poly3d.model.cond_encoder import ConditionalEncoder
 from poly3d.model.flow_matching import FlowMatching
 from poly3d.model.features import smiles_to_data
+from poly3d.model.pos_bias import compute_graph_distance
 from poly3d.model.vae import StructuralVAE
 
 
@@ -105,6 +106,19 @@ def generate_conformers(
     add_h: bool = True,
     n_steps: int = 100,
 ) -> list:
+    """
+    同一分子の n_conf 本のコンフォーマーを、ノードをブロック対角に複製した
+    1 つのバッチにまとめ、flow.sample() を 1 回だけ呼び出して生成する。
+
+    高速化ポイント:
+      - グラフ距離 BFS（compute_graph_distance）は分子 1 本分のみ計算し、
+        torch.block_diag で n_conf 個をブロック対角に複製した dist_mat を
+        flow.sample() に渡す（BFS を n_conf 回 → 1 回に削減）。
+      - flow.sample() 自体の呼び出しも n_conf 回 → 1 回に削減（ODE ステップ内の
+        DiT forward が n_conf 分子分をまとめて 1 回の attention で処理される）。
+      - 各コンフォーマーは flow.sample() 内部で独立にサンプリングされる
+        Z1 ~ N(0,I) から出発するため、逐次実装と同じく互いに異なる乱数となる。
+    """
     use_rwpe = cond_encoder.use_rwpe
     use_lappe = cond_encoder.use_lappe
 
@@ -112,7 +126,7 @@ def generate_conformers(
     n_atoms = data.atom_type_idx.size(0)
     batch_idx = data.batch
 
-    # Conditioning
+    # Conditioning（分子 1 本分のみ計算すればよい）
     _, e_cond, cond = cond_encoder(
         data.atom_type_idx, data.hyb_idx, data.atom_cont,
         data.bond_type_idx, data.bond_cont, data.edge_index,
@@ -127,25 +141,59 @@ def generate_conformers(
     if add_h:
         rdmol = Chem.AddHs(rdmol)
 
+    if n_atoms == 0:
+        return []
+
+    # ── conformer バッチ化: n_conf 回のノード複製をブロック対角に構成 ──
+    edge_index = data.edge_index                      # (2, E)
+    total_atoms = n_atoms * n_conf
+
+    # cond / e_cond は分子構造に依存するだけなので単純にタイル
+    cond_rep = cond.repeat(n_conf, 1)                  # (n_conf*n_atoms, cond_dim)
+    e_cond_rep = e_cond.repeat(n_conf, 1) if e_cond.numel() > 0 else e_cond
+
+    # edge_index はブロックごとに n_atoms オフセットして連結
+    if edge_index.numel() > 0:
+        offsets = (torch.arange(n_conf, device=device) * n_atoms).repeat_interleave(
+            edge_index.size(1)
+        )
+        edge_index_rep = edge_index.repeat(1, n_conf) + offsets.unsqueeze(0)
+    else:
+        edge_index_rep = edge_index.new_empty((2, 0))
+
+    # batch テンソル: どのコンフォーマー（ブロック）に属するかを示す
+    batch_rep = torch.arange(n_conf, device=device).repeat_interleave(n_atoms)
+
+    # グラフ距離 BFS は分子 1 本分だけ計算し、block_diag でブロック対角に複製。
+    # dist_mat を flow.sample() に渡すことで、DiT 側の BFS 再計算（n_conf 回）
+    # を完全にスキップできる（異ブロック間は block-diagonal mask で -1e9 に
+    # 上書きされるため block_diag の off-diagonal 値は 0 で問題ない）。
+    dist_single = compute_graph_distance(edge_index, n_atoms)   # (n_atoms, n_atoms)
+    dist_mat_rep = torch.block_diag(*([dist_single] * n_conf)) if n_conf > 1 else dist_single
+
+    # DiT ODE サンプリング → Z0（n_conf 本まとめて 1 回だけ呼ぶ）
+    z0 = flow.sample(
+        n_atoms=total_atoms,
+        cond=cond_rep,
+        batch=batch_rep,
+        n_steps=n_steps,
+        edge_index=edge_index_rep,
+        device=device,
+        dist_mat=dist_mat_rep,
+    )
+
+    # VAE Decoder → 座標（block-diagonal のまま一括デコード）
+    pos = vae.decode(z0, cond_rep, edge_index_rep, e_cond_rep, batch_rep)  # (total_atoms, 3)
+    pos_np = pos.cpu().numpy().astype(float)
+
     conformers = []
     for conf_idx in range(n_conf):
-        # DiT ODE サンプリング → Z0
-        z0 = flow.sample(
-            n_atoms=n_atoms,
-            cond=cond,
-            batch=batch_idx,
-            n_steps=n_steps,
-            edge_index=data.edge_index,
-            device=device,
-        )
-
-        # VAE Decoder → 座標
-        pos = vae.decode(z0, cond, data.edge_index, e_cond, batch_idx)  # (N, 3)
-        pos_np = pos.cpu().numpy().astype(float)
+        sl = slice(conf_idx * n_atoms, (conf_idx + 1) * n_atoms)
+        pos_i = pos_np[sl]
 
         mol = Chem.RWMol(rdmol)
         conf = Chem.Conformer(n_atoms)
-        for i, (x, y, z) in enumerate(pos_np):
+        for i, (x, y, z) in enumerate(pos_i):
             conf.SetAtomPosition(i, (x, y, z))
         mol.AddConformer(conf, assignId=True)
         mol.SetProp('SMILES', smiles)
