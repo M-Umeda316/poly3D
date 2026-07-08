@@ -34,6 +34,8 @@ def build_vae(args: argparse.Namespace) -> StructuralVAE:
         latent_dim=args.latent_dim,
         enc_layers=args.enc_layers,
         dec_layers=args.dec_layers,
+        egt_every=getattr(args, 'egt_every', 0),
+        enc_egt_every=getattr(args, 'enc_egt_every', 0),
     )
 
 

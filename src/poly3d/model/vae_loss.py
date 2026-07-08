@@ -27,6 +27,7 @@ from poly3d.model.geo_losses import (
     angle_loss, dihedral_loss,
     build_angle_triplets, build_dihedral_quartets,
     kabsch_rmsd_loss, dist_matrix_loss, local_distance_loss,
+    longrange_distance_loss,
 )
 
 
@@ -82,9 +83,19 @@ def vae_loss(
     #   'distmat'       : 全ペア距離行列 MSE（回転不変）
     #   'local_distmat' : 近接ペア（GT < local_cutoff Å）のみの距離 MSE
     #                     大域的な折り畳みに頑健
-    pos_loss_type: Literal['kabsch', 'distmat', 'local_distmat'] = 'kabsch',
+    #   'multiscale_distmat' : local_distmat + long-range distmat（大域の滑らかな教師信号）
+    #                     L_pos = w_local * local + w_global * longrange
+    pos_loss_type: Literal['kabsch', 'distmat', 'local_distmat', 'multiscale_distmat'] = 'kabsch',
     local_cutoff: float = 5.0,
     batch: Optional[Tensor] = None,
+    # multiscale_distmat 用（他の pos_loss_type では未使用）
+    dist_mat: Optional[Tensor] = None,
+    ptr: Optional[Tensor] = None,
+    w_local: float = 1.0,
+    w_global: float = 1.0,
+    longrange_min_graph_dist: int = 4,
+    longrange_max_pairs: int = 256,
+    longrange_huber_delta: float = 1.0,
 ) -> Tuple[Tensor, dict]:
     """
     Parameters
@@ -108,10 +119,27 @@ def vae_loss(
         batch = pos_pred.new_zeros(num_nodes, dtype=torch.long)
 
     # 座標損失（回転・並進不変）
+    # multiscale の内訳ログ用（該当時のみ埋める）
+    l_pos_local: Optional[Tensor] = None
+    l_pos_global: Optional[Tensor] = None
     if pos_loss_type == 'distmat':
         l_pos = dist_matrix_loss(pos_pred, pos_gt, batch)
     elif pos_loss_type == 'local_distmat':
         l_pos = local_distance_loss(pos_pred, pos_gt, batch, cutoff=local_cutoff)
+    elif pos_loss_type == 'multiscale_distmat':
+        # 局所（近接ペア距離）＋ 大域（遠隔ペア距離 Huber, サンプリング版）
+        l_pos_local = local_distance_loss(pos_pred, pos_gt, batch, cutoff=local_cutoff)
+        if dist_mat is not None:
+            l_pos_global = longrange_distance_loss(
+                pos_pred, pos_gt, dist_mat, batch, ptr=ptr,
+                min_graph_dist=longrange_min_graph_dist,
+                max_pairs=longrange_max_pairs,
+                huber_delta=longrange_huber_delta,
+            )
+        else:
+            # dist_mat 未供給時は大域項をスキップ（局所のみで後方互換的に動作）
+            l_pos_global = pos_pred.new_zeros(())
+        l_pos = w_local * l_pos_local + w_global * l_pos_global
     else:
         l_pos = kabsch_rmsd_loss(pos_pred, pos_gt, batch)
 
@@ -147,4 +175,8 @@ def vae_loss(
         'dihedral': l_dihedral.detach(),
         'kl': l_kl.detach(),
     }
+    # multiscale 経路では内訳（局所・大域）も記録
+    if l_pos_local is not None:
+        loss_dict['pos_local'] = l_pos_local.detach()
+        loss_dict['pos_global'] = l_pos_global.detach()
     return total, loss_dict

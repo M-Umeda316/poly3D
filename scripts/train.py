@@ -168,6 +168,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--vae_hidden_dim', type=int, default=128)
     p.add_argument('--enc_layers', type=int, default=4)
     p.add_argument('--dec_layers', type=int, default=4)
+    p.add_argument('--egt_every', type=int, default=0,
+                   help='k>0 で Decoder の k 層ごとに EGNN 層を EGT（大域 attention）に置換。0=無効（後方互換）')
+    p.add_argument('--enc_egt_every', type=int, default=0,
+                   help='k>0 で Encoder の k 層ごとに EGNN 層を EGT に置換。0=無効。'
+                        '潜在に大域構造を符号化させたい場合に使う')
     p.add_argument('--beta_start', type=float, default=0.0)
     p.add_argument('--beta_end', type=float, default=1.0)
     p.add_argument('--beta_warmup_epochs', type=int, default=50)
@@ -176,11 +181,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--w_angle', type=float, default=0.5)
     p.add_argument('--w_dihedral', type=float, default=0.1)
     p.add_argument('--pos_loss_type', type=str, default='kabsch',
-                   choices=['kabsch', 'distmat', 'local_distmat'],
+                   choices=['kabsch', 'distmat', 'local_distmat', 'multiscale_distmat'],
                    help='座標損失の種類: kabsch（Kabsch RMSD）/ distmat（距離行列 MSE）/ '
-                        'local_distmat（近接ペアのみ、大域折り畳みに頑健）')
+                        'local_distmat（近接ペアのみ、大域折り畳みに頑健）/ '
+                        'multiscale_distmat（局所＋long-range 距離、大域折れに滑らかな勾配）')
+    p.add_argument('--w_local', type=float, default=1.0,
+                   help='multiscale_distmat の局所距離損失重み')
+    p.add_argument('--w_global', type=float, default=1.0,
+                   help='multiscale_distmat の long-range 距離損失重み')
     p.add_argument('--local_cutoff', type=float, default=5.0,
                    help='local_distmat の近接ペア閾値（Å）')
+    p.add_argument('--mds_init', action='store_true', default=False,
+                   help='デコーダの初期座標に MDS 大域足場（トポロジー由来）を用いる。'
+                        '0=無効（後方互換、per-atom MLP のみ）')
 
     # DiT
     p.add_argument('--dit_hidden_dim', type=int, default=256)
@@ -195,6 +208,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--batch_size', type=int, default=32)
     p.add_argument('--epochs', type=int, default=300)
     p.add_argument('--lr', type=float, default=1e-4)
+    p.add_argument('--lr_min', type=float, default=0.0,
+                   help='CosineAnnealingLR の eta_min（末尾での LR 下限）。'
+                        '0 だと末尾で LR=0 まで減衰し枯渇するため、短〜中 epoch では lr*0.05 程度を推奨')
     p.add_argument('--weight_decay', type=float, default=1e-5)
     p.add_argument('--grad_clip', type=float, default=1.0)
     p.add_argument('--max_atoms', type=int, default=240)
@@ -223,7 +239,11 @@ def parse_args() -> argparse.Namespace:
 
     # ハイパーパラメータ探索用
     p.add_argument('--subset_ratio', type=float, default=1.0,
-                   help='訓練データのサブセット比率 (0 < r ≤ 1.0)。val は常にフルデータ使用')
+                   help='訓練データのサブセット比率 (0 < r ≤ 1.0)')
+    p.add_argument('--val_subset_ratio', type=float, default=1.0,
+                   help='学習中の val loss 監視用サブセット比率 (0 < r ≤ 1.0)。'
+                        'best ckpt 選択・監視用の指標なので小さくてよい（本評価は eval_by_size.py で別途実施）。'
+                        'デフォルト 1.0 は全 val を使用（従来動作）')
 
     return p.parse_args()
 
@@ -280,7 +300,7 @@ class VAETrainer:
             print(f'Validation: {args.val_every} エポックごと')
 
         self.optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=args.epochs)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=args.epochs, eta_min=args.lr_min)
 
         # サブセットインデックスの計算（subset_ratio < 1.0 の場合のみ）
         subset_idx: Optional[list] = None
@@ -308,13 +328,26 @@ class VAETrainer:
             sampler=self.train_sampler,
             prefetch_factor=args.prefetch_factor,
             subset_indices=subset_idx,
+            mds_init=args.mds_init,
         )
         # val も分散時は DistributedSampler で分割（全ランク重複処理の無駄を排除）。
         # shuffle=False。各ランクのバッチ数差は _all_reduce_dict の加重平均で吸収される。
+        # val 監視用サブセット（best ckpt 選択・監視用。本評価は eval_by_size.py で別途）
+        val_subset_idx: Optional[list] = None
+        if args.val_subset_ratio < 1.0:
+            from poly3d.data.dataset import ConformerDataset as _CDS
+            _vn = len(_CDS(args.val_lmdb, max_atoms=args.max_atoms))
+            val_subset_idx = _make_subset_idx(_vn, args.val_subset_ratio, args.seed)
+            if is_main_process():
+                print(f'val サブセット: {len(val_subset_idx):,} / {_vn:,} サンプル ({args.val_subset_ratio:.0%})')
+
         self.val_sampler: Optional[DistributedSampler] = None
         if dist.is_initialized() and dist.get_world_size() > 1:
             from poly3d.data.dataset import ConformerDataset
             _val_ds = ConformerDataset(args.val_lmdb, max_atoms=args.max_atoms)
+            if val_subset_idx is not None:
+                from torch.utils.data import Subset
+                _val_ds = Subset(_val_ds, val_subset_idx)
             self.val_sampler = DistributedSampler(_val_ds, shuffle=False)
         self.val_loader = make_dataloader(
             args.val_lmdb, batch_size=args.batch_size,
@@ -322,6 +355,8 @@ class VAETrainer:
             num_workers=args.num_workers, max_atoms=args.max_atoms,
             sampler=self.val_sampler,
             prefetch_factor=args.prefetch_factor,
+            subset_indices=val_subset_idx,
+            mds_init=args.mds_init,
         )
 
         self.start_epoch = 1
@@ -411,7 +446,9 @@ class VAETrainer:
                             batch=batch.batch,
                         )
                         pos_pred, mu, logvar = self.vae(
-                            cond, batch.pos, batch.edge_index, e_cond, batch.batch
+                            cond, batch.pos, batch.edge_index, e_cond, batch.batch,
+                            dist_mat=getattr(batch, 'dist_mat', None),
+                            init_scaffold=getattr(batch, 'init_scaffold', None),
                         )
 
                         num_nodes = batch.pos.size(0)
@@ -429,6 +466,11 @@ class VAETrainer:
                             pos_loss_type=self.args.pos_loss_type,
                             local_cutoff=self.args.local_cutoff,
                             batch=batch.batch,
+                            # multiscale_distmat の long-range 項に必要
+                            dist_mat=getattr(batch, 'dist_mat', None),
+                            ptr=getattr(batch, 'ptr', None),
+                            w_local=self.args.w_local,
+                            w_global=self.args.w_global,
                         )
 
                 if train:
@@ -624,7 +666,7 @@ class DiTTrainer:
 
         self.optimizer = AdamW(self.flow.parameters(), lr=args.lr,
                                weight_decay=args.weight_decay)
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=args.epochs)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=args.epochs, eta_min=args.lr_min)
 
         # 事前エンコード済み LMDB が指定された場合は LatentDataset を使用
         self.use_latent = (args.latent_lmdb is not None)

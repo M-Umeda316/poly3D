@@ -34,7 +34,7 @@ import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 
-from poly3d.model.pos_bias import compute_graph_distance
+from poly3d.model.pos_bias import compute_graph_distance, mds_init_coords
 from poly3d.model.geo_losses import build_angle_triplets, build_dihedral_quartets
 
 
@@ -45,10 +45,14 @@ class ConformerDataset(Dataset):
         max_atoms: Optional[int] = None,
         precompute_topology: bool = True,
         topology_cache_size: int = 4096,
+        mds_init: bool = False,
     ):
         self.lmdb_path = str(lmdb_path)
         self.max_atoms = max_atoms
         self.precompute_topology = precompute_topology
+        # mds_init: True のとき __getitem__ で MDS 大域足場（init_scaffold）を付与する。
+        # デフォルト False で完全後方互換（足場を一切計算せず既存挙動を不変に保つ）。
+        self.mds_init = mds_init
         # idx → (dist_mat, triplets, quartets) のワーカーローカル LRU キャッシュ。
         # persistent_workers=True 環境ではエポックをまたいで生存するため、
         # 2 エポック目以降は同一 idx の再計算をスキップできる。
@@ -56,6 +60,8 @@ class ConformerDataset(Dataset):
         # （0 以下でキャッシュ無効化）。
         self.topology_cache_size = topology_cache_size
         self._topo_cache: 'OrderedDict[int, tuple]' = OrderedDict()
+        # idx → init_scaffold(n,3) のワーカーローカル LRU キャッシュ（_topo_cache と同機構）。
+        self._scaffold_cache: 'OrderedDict[int, torch.Tensor]' = OrderedDict()
         self._env: Optional[lmdb.Environment] = None
 
         env = self._open_env()
@@ -115,6 +121,10 @@ class ConformerDataset(Dataset):
             kwargs['triplets'] = triplets
             kwargs['quartets'] = quartets
 
+        if self.mds_init:
+            # MDS 大域足場（純トポロジー、座標非依存）。collate で pos と同様に縦連結。
+            kwargs['init_scaffold'] = self._get_scaffold(idx, edge_index_t, n)
+
         return Data(**kwargs)
 
     def _get_topology(
@@ -159,6 +169,33 @@ class ConformerDataset(Dataset):
 
         return dist_mat, triplets, quartets
 
+    def _get_scaffold(
+        self, idx: int, edge_index_t: torch.Tensor, n: int
+    ) -> torch.Tensor:
+        """
+        MDS 大域足場 init_scaffold (n, 3) float32 を取得する。
+
+        _get_topology と同じワーカーローカル LRU キャッシュ機構を用いる
+        （persistent_workers=True 前提でエポックをまたいで有効。過学習・固定分子
+        では初回のみ計算し以降キャッシュ）。足場は座標非依存な純トポロジー量なので
+        毎エポック同一 idx で結果は変わらない。
+        """
+        if self.topology_cache_size > 0 and idx in self._scaffold_cache:
+            self._scaffold_cache.move_to_end(idx)
+            return self._scaffold_cache[idx].clone()
+
+        # ── ワーカープロセスで計算（GPU スレッドと並列実行）────────────────
+        scaffold = mds_init_coords(edge_index_t, n)   # (n, 3) float32
+
+        if self.topology_cache_size > 0:
+            self._scaffold_cache[idx] = scaffold
+            self._scaffold_cache.move_to_end(idx)
+            if len(self._scaffold_cache) > self.topology_cache_size:
+                self._scaffold_cache.popitem(last=False)
+            return scaffold.clone()
+
+        return scaffold
+
     def close(self) -> None:
         if self._env is not None:
             self._env.close()
@@ -178,7 +215,9 @@ def collate_fn(batch: list) -> Optional[Batch]:
     all_dist_mats = []
     all_triplets  = []
     all_quartets  = []
+    all_scaffolds = []
     has_topology  = hasattr(valid[0], 'dist_mat')
+    has_scaffold  = hasattr(valid[0], 'init_scaffold')
 
     sizes = [d.num_nodes for d in valid]
     total_n = sum(sizes)
@@ -198,9 +237,18 @@ def collate_fn(batch: list) -> Optional[Batch]:
                 all_quartets.append(d.quartets + offset)
             del d.triplets
             del d.quartets
+        if has_scaffold:
+            # init_scaffold: pos と同様に縦連結（ノードオフセット不要の単純 cat）。
+            # 分子順は valid の並び＝pos の並びと一致する。
+            all_scaffolds.append(d.init_scaffold)
+            del d.init_scaffold
         offset += n
 
     pyg_batch = Batch.from_data_list(valid)
+
+    if has_scaffold:
+        # (total_N, 3) float。pos と同じ行順（分子順・原子順）で連結される。
+        pyg_batch.init_scaffold = torch.cat(all_scaffolds, dim=0)
 
     if has_topology:
         # dist_mat: (total_N, total_N) int8 ブロック対角
@@ -243,9 +291,11 @@ def make_dataloader(
     prefetch_factor: int = 4,
     precompute_topology: bool = True,
     subset_indices: Optional[list] = None,
+    mds_init: bool = False,
 ) -> torch.utils.data.DataLoader:
     dataset = ConformerDataset(
-        lmdb_path, max_atoms=max_atoms, precompute_topology=precompute_topology
+        lmdb_path, max_atoms=max_atoms, precompute_topology=precompute_topology,
+        mds_init=mds_init,
     )
     if subset_indices is not None:
         from torch.utils.data import Subset

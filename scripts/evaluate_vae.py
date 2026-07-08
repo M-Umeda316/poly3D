@@ -203,6 +203,9 @@ def _load_models(ckpt: dict, device: torch.device):
     ck_args.setdefault('atom_emb_dim', 32)
     ck_args.setdefault('hyb_emb_dim', 16)
     ck_args.setdefault('bond_emb_dim', 16)
+    ck_args.setdefault('egt_every', 0)   # 旧 ckpt 互換（EGT 導入前）
+    ck_args.setdefault('enc_egt_every', 0)
+    ck_args.setdefault('mds_init', False)   # 旧 ckpt 互換（MDS 足場導入前）
     model_args = argparse.Namespace(**ck_args)
 
     cond_encoder = build_cond_encoder(model_args).to(device)
@@ -228,6 +231,9 @@ def evaluate(args: argparse.Namespace) -> dict:
         args.val_lmdb, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, max_atoms=args.max_atoms,
         precompute_topology=True,
+        # MDS で学習したモデルは init 分布が変わるため評価も足場必須。
+        # 旧 ckpt は margs.mds_init=False（_load_models のデフォルト）で従来経路。
+        mds_init=getattr(model_args, 'mds_init', False),
     )
 
     mu_metrics: dict[str, list] = {k: [] for k in
@@ -257,10 +263,13 @@ def evaluate(args: argparse.Namespace) -> dict:
             lappe=getattr(batch, 'lappe', None),
             batch=batch.batch,
         )
-        mu, logvar = vae.encoder(cond, batch.pos, batch.edge_index, e_cond, batch.batch)
+        mu, logvar = vae.encoder(cond, batch.pos, batch.edge_index, e_cond, batch.batch,
+                                 dist_mat=getattr(batch, 'dist_mat', None))
 
         # ── 主指標: μ を決定論的にデコード ──
-        pos_mu = vae.decode(mu, cond, batch.edge_index, e_cond, batch.batch)
+        pos_mu = vae.decode(mu, cond, batch.edge_index, e_cond, batch.batch,
+                            dist_mat=getattr(batch, 'dist_mat', None),
+                            init_scaffold=getattr(batch, 'init_scaffold', None))
 
         ptr = batch.ptr
         triplets = getattr(batch, 'triplets', None)
@@ -275,7 +284,9 @@ def evaluate(args: argparse.Namespace) -> dict:
         if args.sample:
             std = (0.5 * logvar).exp()
             z = mu + std * torch.randn_like(std)
-            pos_s = vae.decode(z, cond, batch.edge_index, e_cond, batch.batch)
+            pos_s = vae.decode(z, cond, batch.edge_index, e_cond, batch.batch,
+                               dist_mat=getattr(batch, 'dist_mat', None),
+                               init_scaffold=getattr(batch, 'init_scaffold', None))
             pos_s = pos_s.float()
             pos_gt_f = batch.pos.float()
             for m in range(ptr.numel() - 1):

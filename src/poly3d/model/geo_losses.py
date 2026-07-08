@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch_scatter import scatter, scatter_mean
 
@@ -562,3 +563,118 @@ def local_distance_loss(
         mol_mse = mol_sum[has_local] / mol_count[has_local].float()
 
     return mol_mse.mean()
+
+
+def longrange_distance_loss(
+    pos_pred: Tensor,
+    pos_gt: Tensor,
+    dist_mat: Tensor,
+    batch: Tensor,
+    ptr: Optional[Tensor] = None,
+    min_graph_dist: int = 4,
+    max_pairs: int = 256,
+    huber_delta: float = 1.0,
+) -> Tensor:
+    """
+    大域（long-range）距離損失（滑らかな大域教師信号）。
+
+    グラフ距離（結合ホップ数）が `min_graph_dist` 以上の「遠隔ペア」を対象に、
+    予測座標とGT座標のペア間ユークリッド距離の差を Huber (smooth L1) で教師化する。
+    距離は回転・並進不変であり、Kabsch RMSD が torsion-flip（1本のねじれのズレで
+    分子の半分が反転）で不連続に爆発するのを避け、大域構造へ滑らかな勾配を与える。
+
+    全 (N, N) ペアは使わず、分子ごとに最大 `max_pairs` ペアを **棄却サンプリング**
+    で選ぶことで O(B · max_pairs) に計算量を抑える（設計書 §5 の long-range distmat）。
+    各分子内でローカル原子インデックスを一様サンプルし、`dist_mat` のブロック対角
+    構造から真のグラフ距離を引いて `min_graph_dist` 未満のペアを棄却する。
+
+    分子ごとに正規化（local_distance_loss と同じく分子単位で平均 → 分子間平均）。
+    サンプリングは同一分子内のローカルインデックス（共通オフセット `ptr` 由来）で
+    行うため、`dist_mat` の分子間 off-block（= far 埋め）を誤って拾うことはない。
+
+    Parameters
+    ----------
+    pos_pred : (N, 3)  予測座標（勾配はここを通る）
+    pos_gt   : (N, 3)  正解座標
+    dist_mat : (N, N) int  ブロック対角グラフ距離行列（分子内 0-4, 4=far, clamp 済み）
+    batch    : (N,) int  バッチ内の分子インデックス（連続・昇順を仮定; PyG Batch 準拠）
+    ptr      : (B+1,) int  分子境界。None の場合は batch から復元する
+    min_graph_dist : int  遠隔ペアとみなすグラフ距離の下限（例 4=far）
+    max_pairs      : int  1 分子あたりの最大サンプリングペア数
+    huber_delta    : float  Huber 損失の遷移点 δ
+
+    Returns
+    -------
+    scalar loss  (分子ごとの遠隔ペア Huber 距離損失の平均)
+
+    Notes
+    -----
+    サンプリングには torch のグローバル RNG を用いる。再現性が要る場合は呼び出し側で
+    seed を固定すること。eval では seed 固定をしない限りサンプルが毎回ばらつくため、
+    値は近傍で揺らぐ（大域傾向の把握には十分だが厳密な決定論ではない点に注意）。
+    対象ペアが 1 つも無い（または原子数 < 2 の）分子は 0 寄与でスキップする。
+    """
+    N = pos_pred.size(0)
+    if N == 0:
+        return pos_pred.new_zeros(())
+
+    device = pos_pred.device
+
+    # 分子境界 ptr（None なら batch から復元。分子は連続・昇順に並ぶ前提）
+    if ptr is None:
+        counts = torch.bincount(batch)                              # (B,)
+        ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])    # (B+1,)
+    else:
+        counts = ptr[1:] - ptr[:-1]                                 # (B,)
+
+    B = counts.size(0)
+    if B == 0:
+        return pos_pred.new_zeros(())
+
+    starts = ptr[:-1]                          # (B,) 各分子の先頭ノード
+    n_mol = counts.to(torch.float32)          # (B,) 各分子の原子数
+
+    # ── 分子ごとに max_pairs ペアをローカル一様サンプリング（棄却サンプリング）──
+    # ローカルインデックス ia, ib ∈ [0, n_m)。同一分子内なので分子間ペアは生じない。
+    rand_a = torch.rand(B, max_pairs, device=device)
+    rand_b = torch.rand(B, max_pairs, device=device)
+    ia = (rand_a * n_mol.unsqueeze(1)).long()   # floor → [0, n_m-1]
+    ib = (rand_b * n_mol.unsqueeze(1)).long()
+    # rand が 1.0 に極めて近い場合の丸め対策で上限クランプ（n_m>=1 のときのみ有効）
+    max_local = (counts - 1).clamp(min=0).unsqueeze(1)              # (B,1)
+    ia = torch.minimum(ia, max_local)
+    ib = torch.minimum(ib, max_local)
+
+    # グローバルノードインデックスへ変換
+    gi = starts.unsqueeze(1) + ia               # (B, max_pairs)
+    gj = starts.unsqueeze(1) + ib
+    gi = gi.clamp(max=N - 1)                     # 安全のため範囲内に収める
+    gj = gj.clamp(max=N - 1)
+
+    # 真のグラフ距離をブロック対角行列から取得（同一分子内なので off-block を拾わない）
+    gd = dist_mat[gi.reshape(-1), gj.reshape(-1)].view(B, max_pairs)
+
+    # 有効ペア: グラフ距離 >= 閾値 かつ 自己ペアでない かつ 原子数 >= 2
+    valid = (gd >= min_graph_dist) & (ia != ib) & (counts.unsqueeze(1) >= 2)
+
+    # ── 距離差の Huber（fp32 強制。cdist 同様 bf16/fp16 の精度劣化を避ける）──
+    device_type = device.type if device.type != 'cpu' else 'cpu'
+    with torch.autocast(device_type=device_type, enabled=False):
+        gi_flat = gi.reshape(-1)
+        gj_flat = gj.reshape(-1)
+        d_pred = (pos_pred.float()[gi_flat] - pos_pred.float()[gj_flat]).norm(dim=-1).view(B, max_pairs)
+        with torch.no_grad():
+            d_gt = (pos_gt.float()[gi_flat] - pos_gt.float()[gj_flat]).norm(dim=-1).view(B, max_pairs)
+
+        huber = F.huber_loss(d_pred, d_gt, delta=huber_delta, reduction='none')   # (B, max_pairs)
+        huber = huber * valid                                                     # 無効ペアは 0
+
+        mol_count = valid.sum(dim=1)                                              # (B,)
+        has_pair = mol_count > 0
+        if not has_pair.any():
+            return pos_pred.new_zeros(())
+
+        mol_sum = huber.sum(dim=1)
+        mol_mean = mol_sum[has_pair] / mol_count[has_pair].float()
+
+    return mol_mean.mean()
