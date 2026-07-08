@@ -29,7 +29,7 @@ from poly3d.model.builder import build_cond_encoder, build_vae, build_dit
 from poly3d.model.cond_encoder import ConditionalEncoder
 from poly3d.model.flow_matching import FlowMatching
 from poly3d.model.features import smiles_to_data
-from poly3d.model.pos_bias import compute_graph_distance
+from poly3d.model.pos_bias import compute_graph_distance, mds_init_coords
 from poly3d.model.vae import StructuralVAE
 
 
@@ -71,7 +71,9 @@ def load_models(vae_path: str, dit_path: str, device: torch.device):
     flow = FlowMatching(dit, t_max=dit_args.t_max)
     flow.eval()
 
-    return cond_encoder, vae, flow
+    # vae_args（学習時のモデル引数）も返す。EGT/MDS の有無を推論側でゲートするため
+    # generate_conformers が参照する（getattr デフォルトで旧 ckpt にも後方互換）。
+    return cond_encoder, vae, flow, vae_args
 
 
 def smiles_to_pyg(smiles: str, add_h: bool, use_rwpe: bool, use_lappe: bool,
@@ -102,6 +104,7 @@ def generate_conformers(
     vae: StructuralVAE,
     flow: FlowMatching,
     device: torch.device,
+    margs: argparse.Namespace,
     n_conf: int = 1,
     add_h: bool = True,
     n_steps: int = 100,
@@ -182,8 +185,33 @@ def generate_conformers(
         dist_mat=dist_mat_rep,
     )
 
+    # ── 学習時設定に応じた decode 入力のゲート（旧 ckpt 完全後方互換）──
+    # margs から EGT/MDS の有無を読む。旧 ckpt はこれらのキーが無いため
+    # getattr のデフォルト（0 / False）で「従来と同一」の decode 経路になる。
+    dec_uses_egt = getattr(margs, 'egt_every', 0) > 0   # decoder に EGT 層があるか
+    use_mds = getattr(margs, 'mds_init', False)          # MDS 大域足場で学習したか
+
+    # dist_mat: decoder が EGT を使う場合のみ渡す。EGTLayer は分子内ブロック
+    # dm[nl][:,nl] のみ参照するため、dist_mat_rep（block_diag, 各対角ブロック＝
+    # compute_graph_distance(edge_index, n_atoms, max_dist=4)）は dataset.py:157 の
+    # 学習時 per-molecule dist_mat と値が一致する（off-diagonal は未参照で無害）。
+    # EGT 非使用の旧 ckpt では None を渡し従来と完全一致。
+    decode_dist_mat = dist_mat_rep if dec_uses_egt else None
+
+    # init_scaffold: mds_init 学習時のみ。MDS 足場は純トポロジー量なので
+    # 分子 1 本分を mds_init_coords(local edge_index, n_atoms) で計算し、
+    # n_conf 個を単純 cat で縦連結する（dataset.collate と同じ規約：オフセット不要、
+    # pos/cond_rep/batch_rep と同一の分子順・原子順）。旧 ckpt では None（従来経路）。
+    if use_mds:
+        scaffold_single = mds_init_coords(edge_index, n_atoms)   # (n_atoms, 3)
+        init_scaffold = (torch.cat([scaffold_single] * n_conf, dim=0)
+                         if n_conf > 1 else scaffold_single)      # (total_atoms, 3)
+    else:
+        init_scaffold = None
+
     # VAE Decoder → 座標（block-diagonal のまま一括デコード）
-    pos = vae.decode(z0, cond_rep, edge_index_rep, e_cond_rep, batch_rep)  # (total_atoms, 3)
+    pos = vae.decode(z0, cond_rep, edge_index_rep, e_cond_rep, batch_rep,
+                     dist_mat=decode_dist_mat, init_scaffold=init_scaffold)  # (total_atoms, 3)
     pos_np = pos.cpu().numpy().astype(float)
 
     conformers = []
@@ -213,7 +241,7 @@ def main() -> None:
     )
     print(f'Device: {device}')
 
-    cond_encoder, vae, flow = load_models(args.vae_checkpoint, args.dit_checkpoint, device)
+    cond_encoder, vae, flow, margs = load_models(args.vae_checkpoint, args.dit_checkpoint, device)
     print('モデルをロード完了')
 
     if args.smiles:
@@ -232,7 +260,7 @@ def main() -> None:
         print(f'生成中: {smi}')
         try:
             mols = generate_conformers(
-                smi, cond_encoder, vae, flow, device,
+                smi, cond_encoder, vae, flow, device, margs,
                 n_conf=args.n_conf, add_h=args.add_h, n_steps=args.n_steps,
             )
             for mol in mols:

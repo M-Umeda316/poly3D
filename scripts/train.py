@@ -245,6 +245,13 @@ def parse_args() -> argparse.Namespace:
                         'best ckpt 選択・監視用の指標なので小さくてよい（本評価は eval_by_size.py で別途実施）。'
                         'デフォルト 1.0 は全 val を使用（従来動作）')
 
+    # 大分子オーバーサンプリング（VAE stage 専用）
+    p.add_argument('--oversample_alpha', type=float, default=0.0,
+                   help='>0 で原子数^alpha に比例した重みで大分子を過抽出する'
+                        '（WeightedRandomSampler, 復元抽出）。VAE stage 専用・単一GPUのみ。'
+                        '事前に scripts/build_size_index.py で <train_lmdb>.sizes.npy を作ること。'
+                        '0.0（デフォルト）で無効（従来動作を一切変えない）')
+
     return p.parse_args()
 
 
@@ -312,7 +319,7 @@ class VAETrainer:
                 print(f'サブセット: {len(subset_idx):,} / {_n:,} サンプル ({args.subset_ratio:.0%})')
 
         # DistributedSampler（分散モード時）
-        self.train_sampler: Optional[DistributedSampler] = None
+        self.train_sampler: Optional[torch.utils.data.Sampler] = None
         if dist.is_initialized():
             from poly3d.data.dataset import ConformerDataset
             _ds = ConformerDataset(args.train_lmdb, max_atoms=args.max_atoms)
@@ -320,6 +327,12 @@ class VAETrainer:
                 from torch.utils.data import Subset
                 _ds = Subset(_ds, subset_idx)
             self.train_sampler = DistributedSampler(_ds, shuffle=True, seed=args.seed)
+
+        # 大分子オーバーサンプリング（VAE stage 専用・単一GPUのみ）。
+        # alpha=0（デフォルト）では一切この経路に入らず従来動作（train_sampler=None /
+        # DDP時 DistributedSampler）を完全に維持する。
+        if args.oversample_alpha > 0:
+            self._setup_oversampler(args, subset_idx)
 
         self.train_loader = make_dataloader(
             args.train_lmdb, batch_size=args.batch_size,
@@ -369,6 +382,80 @@ class VAETrainer:
         self.writer: Optional[SummaryWriter] = None
         if is_main_process():
             self.writer = SummaryWriter(log_dir=str(self.out_dir / 'tb_vae'))
+
+    def _setup_oversampler(self, args: argparse.Namespace, subset_idx: Optional[list]) -> None:
+        """
+        原子数^alpha に比例した重みの WeightedRandomSampler を構築して
+        self.train_sampler に設定する（大分子オーバーサンプリング）。
+
+        重み設計:
+          - 全 idx に対し w_i = size_i^alpha
+          - size_i <= 0（欠損）または size_i > max_atoms は w_i = 0.0（抽出対象外）
+          - subset を使う場合は subset_idx の順序に整列した重みを作る
+            （WeightedRandomSampler は Subset のローカル添字 0..k-1 を返すため整合）
+
+        DDP とは併用不可（コレクティブ通信・DistributedSampler と競合するため）。
+        """
+        import numpy as np
+        from torch.utils.data import WeightedRandomSampler
+
+        if dist.is_initialized():
+            raise NotImplementedError('oversampling は単一GPUのみ対応')
+
+        alpha = float(args.oversample_alpha)
+        sizes_path = Path(str(args.train_lmdb) + '.sizes.npy')
+        if not sizes_path.exists():
+            raise FileNotFoundError(
+                f'サイズインデックスが見つかりません: {sizes_path}\n'
+                f'先に以下を実行してください:\n'
+                f'  "{__import__("sys").executable}" scripts/build_size_index.py '
+                f'--src {args.train_lmdb}'
+            )
+        sizes = np.load(sizes_path)
+
+        # 全 idx の重み（max_atoms 超・欠損は 0.0）
+        w_all = np.where(
+            (sizes > 0) & (sizes <= args.max_atoms),
+            sizes.astype(np.float64) ** alpha,
+            0.0,
+        )
+
+        if subset_idx is not None:
+            idx_arr = np.asarray(subset_idx, dtype=np.int64)
+            weights = w_all[idx_arr]          # subset_idx 順に整列
+            sub_sizes = sizes[idx_arr]
+            num_samples = len(subset_idx)
+        else:
+            weights = w_all
+            sub_sizes = sizes
+            num_samples = len(sizes)
+
+        w_sum = float(weights.sum())
+        if w_sum <= 0:
+            raise ValueError(
+                'オーバーサンプリング重みの総和が 0 です。'
+                f'プール内に 0 < 原子数 <= max_atoms({args.max_atoms}) の分子がありません。'
+            )
+
+        self.train_sampler = WeightedRandomSampler(
+            torch.as_tensor(weights, dtype=torch.double),
+            num_samples=num_samples,
+            replacement=True,
+        )   # generator は渡さない（グローバル RNG / torch.manual_seed 済み）
+
+        # 要約（main プロセスのみ）
+        if is_main_process():
+            pool_mask = weights > 0
+            n_pool = int(pool_mask.sum())
+            large_mask = sub_sizes >= 130
+            frac_large_pool = (
+                float((large_mask & pool_mask).sum()) / n_pool if n_pool > 0 else 0.0
+            )
+            exp_large = float(weights[large_mask].sum()) / w_sum
+            print(f'オーバーサンプリング: alpha={alpha:.2f}  '
+                  f'プール件数={n_pool:,} / {len(weights):,}')
+            print(f'  >=130 原子の割合: プール内 {frac_large_pool*100:.1f}% '
+                  f'→ 抽出期待 {exp_large*100:.1f}%')
 
     def _get_beta(self, epoch: int) -> float:
         a = self.args
@@ -557,7 +644,9 @@ class VAETrainer:
                 f.write('epoch,beta,train_total,val_total,val_pos,val_kl,lr,elapsed\n')
 
         for epoch in range(self.start_epoch, self.args.epochs + 1):
-            if self.train_sampler is not None:
+            # DistributedSampler は set_epoch で shuffle 再シードが必要。
+            # WeightedRandomSampler は set_epoch を持たない（グローバル RNG で毎回変動）。
+            if self.train_sampler is not None and hasattr(self.train_sampler, 'set_epoch'):
                 self.train_sampler.set_epoch(epoch)
 
             beta = self._get_beta(epoch)

@@ -109,7 +109,10 @@ def main():
                     lappe=getattr(batch, 'lappe', None),
                     batch=batch.batch,
                 )
-                mu, _ = vae.encoder(cond, batch.pos, batch.edge_index, e_cond, batch.batch)
+                # EGT エンコーダ（enc_egt_every>0）は大域アテンションに dist_mat が必須。
+                # 渡さないと学習時と別物のエンコーダで μ を計算し潜在が壊れる。
+                mu, _ = vae.encoder(cond, batch.pos, batch.edge_index, e_cond,
+                                    batch.batch, dist_mat=getattr(batch, 'dist_mat', None))
 
             # float32 に戻してから保存（後でそのまま使えるように）
             cond_fp32   = cond.float().cpu()
