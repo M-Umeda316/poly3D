@@ -27,16 +27,25 @@
 #   dominates (>~35%, starving the main dist) lower it.
 # --------------------------------------------------------------------------------
 #
-# Launch (foreground):
+# Launch (foreground, WATCH the tqdm bar live on console):
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_D_over.ps1 -Live
+# Launch (foreground, quiet - everything to logs):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_D_over.ps1
-# Launch (OS-detached, harness idle-kill resistant):
+# Launch (OS-detached, harness idle-kill resistant; no console, so no -Live):
 #   Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',
 #     '<repo>/scripts/run_D_over.ps1' -WindowStyle Hidden -PassThru
+#
+# -Live: streams stderr (the tqdm progress bar + any traceback) to the console so
+#   you can watch progress. stdout summaries + vae_log.csv + status are STILL
+#   written to files, so reporting is unaffected. Without -Live, stderr goes to
+#   D_err.log (and train.py auto-hides the bar on non-TTY = no CR spam in the log).
 #
 # REPORTING (no need to copy files back): paste back
 #   1) runs/gen_v1/D_egt_over/vae_log.csv   (per-epoch train/val loss)
 #   2) runs/gen_v1/D_eval.log               (size-binned + endpoint tables)
 #      plus the "oversampling: alpha=.. exp_large=.." line from D_out.log
+
+param([switch]$Live)   # -Live: show tqdm bars on console (stderr unredirected)
 
 if ($env:POLY3D_PY) { $py = $env:POLY3D_PY } else { $py = "python" }
 # repo root = two levels up from scripts/run_D_over.ps1
@@ -72,7 +81,11 @@ if (-not (Test-Path $base)) { New-Item -ItemType Directory -Force -Path $base | 
 # --oversample_alpha needs <train_lmdb>.sizes.npy. Skips if already present.
 if (-not (Test-Path $sizes)) {
     "SIZEIDX_START $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
-    & $py "scripts/build_size_index.py" --src "data/train.lmdb" 1> "$base/D_sizeidx.log" 2>&1
+    if ($Live) {
+        & $py "scripts/build_size_index.py" --src "data/train.lmdb"
+    } else {
+        & $py "scripts/build_size_index.py" --src "data/train.lmdb" 1> "$base/D_sizeidx.log" 2>&1
+    }
     "SIZEIDX_DONE exit=$LASTEXITCODE $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
     if (-not (Test-Path $sizes)) {
         "SIZEIDX_FAILED - aborting" | Out-File -Append -Encoding ascii $status; exit 1
@@ -101,7 +114,13 @@ if (-not (Done "D_DONE")) {
     $ck = LatestCkpt $outD
     if ($ck) { $argsD += @("--resume",$ck) }
     "D_START $(Get-Date -Format o) resume=$ck alpha=$alpha" | Out-File -Append -Encoding ascii $status
-    & $py "scripts/train.py" @argsD 1> "$base/D_out.log" 2> "$base/D_err.log"
+    if ($Live) {
+        # stdout summaries + vae_log.csv still logged; stderr (tqdm bar + any
+        # traceback) streams to the console so you can watch it live.
+        & $py "scripts/train.py" @argsD 1> "$base/D_out.log"
+    } else {
+        & $py "scripts/train.py" @argsD 1> "$base/D_out.log" 2> "$base/D_err.log"
+    }
     $ec = $LASTEXITCODE
     "D_DONE exit=$ec $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
     if ($ec -ne 0) { "TRAIN_FAILED - skipping eval" | Out-File -Append -Encoding ascii $status; exit $ec }

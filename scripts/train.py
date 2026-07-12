@@ -41,6 +41,7 @@ import argparse
 import gc
 import os
 import random
+import sys
 import time
 
 # CUDA アロケータの断片化緩和（torch import より前に設定）
@@ -511,8 +512,12 @@ class VAETrainer:
         if train:
             self.optimizer.zero_grad(set_to_none=True)
 
+        # stderr がファイル等の非TTYへリダイレクトされている場合はバーを自動無効化
+        # （ログにCR更新スパムを残さない。コンソール実行時のみ表示）。
+        _tty = bool(getattr(sys.stderr, 'isatty', lambda: False)())
         pbar = tqdm(loader, desc='Train' if train else 'Val',
-                    leave=False, dynamic_ncols=True, disable=not is_main_process())
+                    leave=False, dynamic_ncols=True,
+                    disable=(not is_main_process()) or not _tty)
 
         for step, batch in enumerate(pbar):
             if batch is None:
@@ -890,8 +895,12 @@ class DiTTrainer:
         if train:
             self.optimizer.zero_grad(set_to_none=True)
 
+        # stderr がファイル等の非TTYへリダイレクトされている場合はバーを自動無効化
+        # （ログにCR更新スパムを残さない。コンソール実行時のみ表示）。
+        _tty = bool(getattr(sys.stderr, 'isatty', lambda: False)())
         pbar = tqdm(loader, desc='Train' if train else 'Val',
-                    leave=False, dynamic_ncols=True, disable=not is_main_process())
+                    leave=False, dynamic_ncols=True,
+                    disable=(not is_main_process()) or not _tty)
 
         for step, batch in enumerate(pbar):
             if batch is None:
