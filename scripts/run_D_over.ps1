@@ -93,8 +93,12 @@ if (-not (Test-Path $sizes)) {
 }
 
 # ---- Train: enc+dec EGT, 40ep sustained LR, data 0.10 + large oversampling --------
-# eff batch 32 (bs8 x ga4) kept identical to Step 1 (run_C_long40) for a clean
-# data-lever comparison. Single-GPU only (oversampling is DDP-incompatible).
+# eff batch 32 (bs16 x ga2) = same effective batch / #optimizer steps / LR dynamics
+# as Step 1 (run_C_long40 used bs8 x ga4), so C vs D stays a clean data-lever
+# comparison. bs16 x ga2 is faster (fewer, larger micro-batches) and fits 16GB:
+# an all-giant (>=240 atom) bs16 batch probed at ~6.4GB peak. 32GB has ample room.
+# Single-GPU only (oversampling is DDP-incompatible). If VRAM ever OOMs over many
+# epochs (Windows fragmentation), drop to bs8 x ga4 (proven ~5.1GB peak).
 if (-not (Done "D_DONE")) {
     $argsD = @(
         "--stage","vae",
@@ -106,7 +110,7 @@ if (-not (Done "D_DONE")) {
         "--subset_ratio","0.10","--val_subset_ratio","0.02",
         "--oversample_alpha",$alpha,
         "--pos_loss_type","kabsch",
-        "--batch_size","8","--grad_accum","4",
+        "--batch_size","16","--grad_accum","2",
         "--egt_every","2","--enc_egt_every","2",
         "--num_workers","8","--save_every","1","--seed","42",
         "--out_dir",$outD
