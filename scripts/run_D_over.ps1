@@ -93,12 +93,14 @@ if (-not (Test-Path $sizes)) {
 }
 
 # ---- Train: enc+dec EGT, 40ep sustained LR, data 0.10 + large oversampling --------
-# eff batch 32 (bs16 x ga2) = same effective batch / #optimizer steps / LR dynamics
-# as Step 1 (run_C_long40 used bs8 x ga4), so C vs D stays a clean data-lever
-# comparison. bs16 x ga2 is faster (fewer, larger micro-batches) and fits 16GB:
-# an all-giant (>=240 atom) bs16 batch probed at ~6.4GB peak. 32GB has ample room.
-# Single-GPU only (oversampling is DDP-incompatible). If VRAM ever OOMs over many
-# epochs (Windows fragmentation), drop to bs8 x ga4 (proven ~5.1GB peak).
+# eff batch 32 (bs8 x ga4) = identical to Step 1 (run_C_long40) => clean C vs D
+# data-lever comparison. Single-GPU only (oversampling is DDP-incompatible).
+# LESSON (2026-07-12): bs16 fit a FRESH giant batch (~6.4GB) but OOM'd in epoch 1
+# on the 16GB box - oversampling packs heavy large-mol batches and Windows lacks
+# expandable_segments, so VRAM fragments over ~1000 steps until a heavy batch can't
+# allocate, then the allocator wedges (empty_cache fails). bs8 keeps the per-batch
+# peak ~5GB with headroom; run_C proved bs8 x ga4 completes 40ep on the 32GB box.
+# If it still OOMs late, drop to bs4 x ga8 (gen_v1 B reached epoch 13 at bs4).
 if (-not (Done "D_DONE")) {
     $argsD = @(
         "--stage","vae",
@@ -110,7 +112,7 @@ if (-not (Done "D_DONE")) {
         "--subset_ratio","0.10","--val_subset_ratio","0.02",
         "--oversample_alpha",$alpha,
         "--pos_loss_type","kabsch",
-        "--batch_size","16","--grad_accum","2",
+        "--batch_size","8","--grad_accum","4",
         "--egt_every","2","--enc_egt_every","2",
         "--num_workers","8","--save_every","1","--seed","42",
         "--out_dir",$outD
@@ -126,8 +128,16 @@ if (-not (Done "D_DONE")) {
         & $py "scripts/train.py" @argsD 1> "$base/D_out.log" 2> "$base/D_err.log"
     }
     $ec = $LASTEXITCODE
-    "D_DONE exit=$ec $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
-    if ($ec -ne 0) { "TRAIN_FAILED - skipping eval" | Out-File -Append -Encoding ascii $status; exit $ec }
+    # Only mark D_DONE on SUCCESS. On failure (e.g. OOM), write D_FAILED and exit
+    # WITHOUT D_DONE, so relaunching re-enters this block and LatestCkpt resumes
+    # from the newest vae_epoch*.pt (save_every 1). Writing D_DONE on failure would
+    # make Done("D_DONE") skip training on relaunch and jump to eval a missing ckpt.
+    if ($ec -ne 0) {
+        "D_FAILED exit=$ec $(Get-Date -Format o) - relaunch to resume from latest ckpt" |
+            Out-File -Append -Encoding ascii $status
+        exit $ec
+    }
+    "D_DONE exit=0 $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
 }
 
 # ---- Auto-eval (GPU free now; no concurrent processes) ----------------------------
