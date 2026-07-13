@@ -51,6 +51,13 @@ if ($env:POLY3D_PY) { $py = $env:POLY3D_PY } else { $py = "python" }
 # repo root = two levels up from scripts/run_D_over.ps1
 $repo = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $env:PYTHONUTF8 = "1"
+# train.py etc. emit UTF-8 (PYTHONUTF8 + stdout.reconfigure). PS 5.1 decodes a
+# native process's stdout using [Console]::OutputEncoding, which defaults to cp932
+# on a Japanese Windows -> UTF-8 bytes get mis-decoded as Shift-JIS -> the log is
+# garbled (then written as UTF-16 by '>'). Force UTF-8 on the PS decode side so the
+# bytes round-trip. Restored at the end so we don't disturb the parent console.
+$prevOutEnc = [Console]::OutputEncoding
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 # VRAM fragmentation mitigation (Windows has no expandable_segments). Harmless on 32GB.
 $env:PYTORCH_CUDA_ALLOC_CONF = "garbage_collection_threshold:0.6,max_split_size_mb:256"
 Set-Location $repo
@@ -167,3 +174,6 @@ if (-not (Done "EVAL_DONE")) {
 }
 
 "ALL_DONE $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
+
+# Restore the parent console's output encoding (no-op if run detached).
+[Console]::OutputEncoding = $prevOutEnc
