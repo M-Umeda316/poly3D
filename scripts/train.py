@@ -627,6 +627,11 @@ class VAETrainer:
             n += 1
             if is_main_process():
                 pbar.set_postfix({k: f'{sums[k]/n:.4f}' for k in sums})
+                if train and torch.cuda.is_available() and n % 200 == 0:
+                    print(f'[VRAM] step{n} '
+                          f'alloc={torch.cuda.max_memory_allocated()/1e9:.2f}GB '
+                          f'reserved={torch.cuda.max_memory_reserved()/1e9:.2f}GB',
+                          flush=True)
 
             # TensorBoard 途中経過（train のみ）
             if train and is_main_process() and tb_every > 0 and n % tb_every == 0:
@@ -655,8 +660,15 @@ class VAETrainer:
                 self.train_sampler.set_epoch(epoch)
 
             beta = self._get_beta(epoch)
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
             t0 = time.time()
             tr = self._run_epoch(self.train_loader, True, beta)
+            if is_main_process() and torch.cuda.is_available():
+                print(f'[VRAM] ep{epoch} train_peak '
+                      f'alloc={torch.cuda.max_memory_allocated()/1e9:.2f}GB '
+                      f'reserved={torch.cuda.max_memory_reserved()/1e9:.2f}GB',
+                      flush=True)
 
             run_val = (epoch % self.args.val_every == 0) or (epoch == self.args.epochs)
             va = self._run_epoch(self.val_loader, False, beta) if run_val else {}
@@ -1001,6 +1013,11 @@ class DiTTrainer:
             n += 1
             if is_main_process():
                 pbar.set_postfix({k: f'{sums[k]/n:.4f}' for k in sums})
+                if train and torch.cuda.is_available() and n % 200 == 0:
+                    print(f'[VRAM] step{n} '
+                          f'alloc={torch.cuda.max_memory_allocated()/1e9:.2f}GB '
+                          f'reserved={torch.cuda.max_memory_reserved()/1e9:.2f}GB',
+                          flush=True)
 
             # TensorBoard 途中経過（train のみ）
             if train and is_main_process() and tb_every > 0 and n % tb_every == 0:
