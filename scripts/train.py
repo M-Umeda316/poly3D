@@ -227,6 +227,11 @@ def parse_args() -> argparse.Namespace:
                    help='混合精度 (bf16) を無効化。デフォルト: AMP 有効')
     p.add_argument('--grad_accum', type=int, default=1,
                    help='勾配累積ステップ数。実効 batch_size = batch_size × grad_accum')
+    p.add_argument('--empty_cache_every', type=int, default=0,
+                   help='N step ごとに torch.cuda.empty_cache() で予約メモリの断片化を'
+                        'リセット（0=無効）。Windows は expandable_segments 非対応で'
+                        '可変分子サイズだと reserved が肥大するため、実使用が小さいのに'
+                        '天井に張り付く場合の対策。計算には非干渉。')
     p.add_argument('--prefetch_factor', type=int, default=4,
                    help='DataLoader ワーカーあたりのプリフェッチバッチ数')
     p.add_argument('--val_every', type=int, default=1,
@@ -632,6 +637,10 @@ class VAETrainer:
                           f'alloc={torch.cuda.max_memory_allocated()/1e9:.2f}GB '
                           f'reserved={torch.cuda.max_memory_reserved()/1e9:.2f}GB',
                           flush=True)
+            if (train and torch.cuda.is_available()
+                    and self.args.empty_cache_every > 0
+                    and n % self.args.empty_cache_every == 0):
+                torch.cuda.empty_cache()
 
             # TensorBoard 途中経過（train のみ）
             if train and is_main_process() and tb_every > 0 and n % tb_every == 0:
@@ -1018,6 +1027,10 @@ class DiTTrainer:
                           f'alloc={torch.cuda.max_memory_allocated()/1e9:.2f}GB '
                           f'reserved={torch.cuda.max_memory_reserved()/1e9:.2f}GB',
                           flush=True)
+            if (train and torch.cuda.is_available()
+                    and self.args.empty_cache_every > 0
+                    and n % self.args.empty_cache_every == 0):
+                torch.cuda.empty_cache()
 
             # TensorBoard 途中経過（train のみ）
             if train and is_main_process() and tb_every > 0 and n % tb_every == 0:

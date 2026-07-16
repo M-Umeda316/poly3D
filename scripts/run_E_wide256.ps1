@@ -74,11 +74,15 @@ if (-not (Test-Path $base)) { New-Item -ItemType Directory -Force -Path $base | 
 
 # ---- Train: wide256 + enc+dec EGT, 40ep sustained LR, data 0.03 uniform ------------
 # eff batch 32 (bs8 x ga4) = identical to run_C so C vs E isolates the width change.
-# wide256 ~2x the activations of hidden128; on 32GB bs8 has ample headroom (hidden128
-# EGT peaked ~5GB at bs8 on 16GB). Data is UNIFORM 0.03 (no oversample) so batches
-# follow the natural dist (mostly <130 atoms) - none of run_D's large-mol-dense
-# fragmentation risk. If it still OOMs late, drop to bs4 x ga8 (keeps eff 32); if
-# VRAM stays low you may try bs16 x ga2 (also eff 32, fewer accum steps = faster).
+# wide256 ~2x the activations of hidden128, but MEASURED real usage is tiny: on the
+# 32GB box the training peak was alloc=4.13GB. The problem was RESERVED memory: it
+# ballooned to 18.66GB in epoch 1 and kept climbing each epoch = pure fragmentation
+# (Windows has no expandable_segments, and the EGT dist_bias buffer changes size with
+# every batch's max_n so the caching allocator never reuses blocks). Fix = periodic
+# --empty_cache_every 500 (releases the fragmented cache back; harmless to the math
+# since only ~4GB is ever live). If reserved still creeps, lower it to 200.
+# bs8 x ga4 stays identical to run_C so C vs E isolates the width change. bs4 x ga8
+# or bs16 x ga2 are also eff 32 if ever needed, but with empty_cache bs8 fits easily.
 if (-not (Done "E_DONE")) {
     $argsE = @(
         "--stage","vae",
@@ -93,6 +97,7 @@ if (-not (Done "E_DONE")) {
         "--enc_layers","4","--dec_layers","4","--latent_dim","16",
         "--batch_size","8","--grad_accum","4",
         "--egt_every","2","--enc_egt_every","2",
+        "--empty_cache_every","500",
         "--num_workers","8","--save_every","1","--seed","42",
         "--out_dir",$outE
     )
