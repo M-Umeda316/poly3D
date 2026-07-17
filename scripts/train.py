@@ -227,6 +227,13 @@ def parse_args() -> argparse.Namespace:
                    help='混合精度 (bf16) を無効化。デフォルト: AMP 有効')
     p.add_argument('--grad_accum', type=int, default=1,
                    help='勾配累積ステップ数。実効 batch_size = batch_size × grad_accum')
+    p.add_argument('--gnorm_log_every', type=int, default=0,
+                   help='N optimizer step ごとに [GNORM] 行（クリップ前の勾配ノルム・'
+                        'クリップ率）を出力（0=無効, epoch 毎の集計は常に出力）。'
+                        'grad_clip が常時発火していると更新が -lr*g/||g|| の正規化'
+                        '勾配降下になり、パラメータ数が増えるほど実効 LR が縮む'
+                        '（∝ lr/√P）。幅・深さを変えた比較では必ず確認する。'
+                        '計算には非干渉。')
     p.add_argument('--empty_cache_every', type=int, default=0,
                    help='N step ごとに torch.cuda.empty_cache() で予約メモリの断片化を'
                         'リセット（0=無効）。Windows は expandable_segments 非対応で'
@@ -600,6 +607,16 @@ class VAETrainer:
                         self._gnorm_sum += float(gnorm)
                         self._gnorm_n += 1
                         self._gnorm_clipped += int(float(gnorm) > self.args.grad_clip)
+                        # step 単位でも出す（epoch 単位だけだと幅256で1行27分かかり、
+                        # 短時間プローブができない）。0=無効。
+                        if (is_main_process() and self.args.gnorm_log_every > 0
+                                and self._gnorm_n % self.args.gnorm_log_every == 0):
+                            print(f'[GNORM] optstep{self._gnorm_n} '
+                                  f'norm={float(gnorm):.3f} '
+                                  f'mean={self._gnorm_sum/self._gnorm_n:.3f} '
+                                  f'clip={self.args.grad_clip} '
+                                  f'clipped={100*self._gnorm_clipped/self._gnorm_n:.1f}%',
+                                  flush=True)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
             except (torch.cuda.OutOfMemoryError, torch.AcceleratorError) as e:
