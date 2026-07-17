@@ -513,6 +513,9 @@ class VAETrainer:
         n_batches = len(loader)
         accum = self.args.grad_accum
         tb_every = self.args.tb_log_every
+        self._gnorm_sum = 0.0
+        self._gnorm_n = 0
+        self._gnorm_clipped = 0
 
         if train:
             self.optimizer.zero_grad(set_to_none=True)
@@ -586,10 +589,17 @@ class VAETrainer:
                         (loss / accum).backward()
 
                     if is_accum_step:
-                        nn.utils.clip_grad_norm_(
+                        # clip_grad_norm_ はクリップ「前」の総ノルムを返す（追加計算なし）。
+                        # これが grad_clip を常時大きく超える = 更新が毎回 grad_clip/||g||
+                        # 倍に縮小され、名目 LR より実効 LR が小さい＝アンダートレーニング。
+                        # 幅を変えると ||g|| も変わるため、幅比較では必ずこれを確認する。
+                        gnorm = nn.utils.clip_grad_norm_(
                             list(self.cond_encoder.parameters()) + list(self.vae.parameters()),
                             self.args.grad_clip,
                         )
+                        self._gnorm_sum += float(gnorm)
+                        self._gnorm_n += 1
+                        self._gnorm_clipped += int(float(gnorm) > self.args.grad_clip)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
             except (torch.cuda.OutOfMemoryError, torch.AcceleratorError) as e:
@@ -677,6 +687,15 @@ class VAETrainer:
                 print(f'[VRAM] ep{epoch} train_peak '
                       f'alloc={torch.cuda.max_memory_allocated()/1e9:.2f}GB '
                       f'reserved={torch.cuda.max_memory_reserved()/1e9:.2f}GB',
+                      flush=True)
+            # clipped が常時 ~100% だと実効 LR = grad_clip/||g|| 倍に縮み、
+            # 名目 LR スケジュールが効かない。幅・深さを変えた比較では ||g|| も
+            # 変わるので、条件間でこの行を必ず突き合わせる。
+            if is_main_process() and self._gnorm_n > 0:
+                print(f'[GNORM] ep{epoch} '
+                      f'mean={self._gnorm_sum/self._gnorm_n:.3f} '
+                      f'clip={self.args.grad_clip} '
+                      f'clipped={100*self._gnorm_clipped/self._gnorm_n:.1f}%',
                       flush=True)
 
             run_val = (epoch % self.args.val_every == 0) or (epoch == self.args.epochs)
