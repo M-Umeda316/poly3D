@@ -9,14 +9,22 @@
 # is invalid and must be re-done once the cause is fixed.
 #
 # Prime suspect: --grad_clip 1.0 (train.py, VAETrainer) clips the GLOBAL grad norm
-# over cond_encoder+vae on every optimizer step. If ||g|| >> 1.0 essentially
-# always, the update degenerates to
-#       delta = -lr * g/||g||            (normalized gradient descent)
-# whose step LENGTH is exactly lr regardless of the gradient. Spreading a fixed
-# step length over 4x more parameters (hidden 128->256 ~ 4x weights) shrinks the
-# per-parameter movement by ~2x => E was really "width x2 AND effective LR /2",
-# not the intended one-variable width test. Measured on a toy (tiny16, hidden 32):
-# mean ||g|| = 8.65 with clip=1.0, clipped=100% of steps -- clipping is ALWAYS on.
+# over cond_encoder+vae on every optimizer step, so if ||g|| >> 1.0 essentially
+# always, the optimizer only ever sees the unit vector g/||g||.
+#
+# RESULT (2026-07-17, this probe): clipping is ALWAYS on, in BOTH configs and BOTH
+# regimes -- c 47.4 / e 73.4 mean ||g|| at convergence, c ~5 / e ~63 (spikes to
+# 97.6) at init, clipped=100.0% everywhere.
+#
+# Read it carefully though: the optimizer is AdamW (train.py:322), and Adam's
+# m/(sqrt(v)+eps) is invariant to rescaling g by a CONSTANT, so permanent clipping
+# does NOT simply shrink the step the way it would under SGD -- the per-coordinate
+# step stays ~lr. What it does destroy is the RELATIVE size across steps: the clip
+# factor 1/||g_t|| varies per step, so a heavy batch holding a 240+ giant (||g||
+# ~97 measured) feeds Adam's m/v as the same "one unit" as an easy batch (~3). Rare
+# hard examples lose the larger pull they should have, and the 1.0 norm budget is
+# zero-sum across the batch -- pushing giants necessarily starves small molecules,
+# which is exactly the trade-off run_D (oversampling) hit and we read as capacity.
 #
 # This probe measures ||g|| directly for both configs, in both regimes:
 #   *_conv : resume the CONVERGED C/E checkpoints  <- the decision-relevant one.
@@ -24,17 +32,17 @@
 #   *_init : fresh init                            <- explains why E was already
 #            2.4x behind C at epoch 1 (val_pos 4.59 vs 1.95).
 #
-# READ THE RESULT --------------------------------------------------------------
-#   E clipped ~100% AND mean ||g|| ~2x C's  -> mechanism CONFIRMED. Re-run BOTH C
-#       and E with a loose clip (e.g. --grad_clip 10.0). Both must be retaken: C
-#       sat under the same throttle, so changing only E breaks comparability.
-#   both clipped only a few %              -> clip is innocent. E's stall has a
-#       different cause (e.g. lr 3e-4 too hot for width 256); probe LR instead.
-# Beyond the width question: "optimization/step-count is the only lever that ever
-# moves anything" has been this project's recurring finding (bs16->bs8->bs4 gave
-# 0.42->0.39->0.13; 240+ froze the moment LR decayed). Permanent clipping is the
-# signature of exactly that -- total distance travelled = n_steps * lr, and the
-# loss landscape barely matters. So this probe may be worth far more than Step3.
+# WHAT THE RESULT LEAVES OPEN --------------------------------------------------
+# Two separable follow-ups, do NOT vary both at once:
+#   (1) width question: E's ||g|| explodes at INIT (~63 mean, 97.6 spikes, ~10x C's
+#       ~5) => width 256 at lr 3e-4 looks genuinely unstable early, and E's curve
+#       agrees (val_pos reached 1.900 at ep7, then got WORSE, flat from ep16). Try
+#       LR warmup and/or a lower lr for the wide config before judging capacity.
+#   (2) clip question (project-wide, likely the bigger prize): raise --grad_clip
+#       (e.g. 10.0) and re-run C. If 240+ finally moves, the giant-molecule signal
+#       was being clipped away all along, and Step1/Step2's verdicts need revisiting.
+#       C must be retaken too -- it sat under the same clip, so changing only E
+#       would break comparability.
 #
 # COST: subset_ratio 0.001 (~4.8k mol) => ~150 optimizer steps per run, ~1-3 min
 # each. Nothing here trains anything; the checkpoints written under F_probe/ are

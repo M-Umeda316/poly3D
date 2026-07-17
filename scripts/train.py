@@ -230,10 +230,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--gnorm_log_every', type=int, default=0,
                    help='N optimizer step ごとに [GNORM] 行（クリップ前の勾配ノルム・'
                         'クリップ率）を出力（0=無効, epoch 毎の集計は常に出力）。'
-                        'grad_clip が常時発火していると更新が -lr*g/||g|| の正規化'
-                        '勾配降下になり、パラメータ数が増えるほど実効 LR が縮む'
-                        '（∝ lr/√P）。幅・深さを変えた比較では必ず確認する。'
-                        '計算には非干渉。')
+                        '計算には非干渉。実測: C(hidden128)/E(hidden256) とも収束後で'
+                        'mean||g||=47/73・clipped=100% ＝常時クリップ。')
     p.add_argument('--empty_cache_every', type=int, default=0,
                    help='N step ごとに torch.cuda.empty_cache() で予約メモリの断片化を'
                         'リセット（0=無効）。Windows は expandable_segments 非対応で'
@@ -597,9 +595,18 @@ class VAETrainer:
 
                     if is_accum_step:
                         # clip_grad_norm_ はクリップ「前」の総ノルムを返す（追加計算なし）。
-                        # これが grad_clip を常時大きく超える = 更新が毎回 grad_clip/||g||
-                        # 倍に縮小され、名目 LR より実効 LR が小さい＝アンダートレーニング。
-                        # 幅を変えると ||g|| も変わるため、幅比較では必ずこれを確認する。
+                        # 実測（2026-07-17）: C(hidden128) mean||g||=47.4 / E(hidden256)
+                        # 73.4、いずれも clipped=100% ＝全ステップでクリップ発火し、
+                        # optimizer には常に単位ノルム g/||g|| しか渡っていない。
+                        # 注意: optimizer は AdamW。Adam の更新 m/(sqrt(v)+eps) は g の
+                        # 「定数倍」に不変なので、常時クリップでも 1 step の大きさは
+                        # ほぼ lr のまま＝SGD 的な「実効 LR が縮む」話にはならない。
+                        # 効くのは別筋で、クリップ係数 1/||g_t|| が step ごとに変動する
+                        # ため step 間の相対的な大きさが消える: 巨大分子を含む重い
+                        # バッチ（||g||~97 を実測）が、易しいバッチ（~3）と同じ「1
+                        # 単位」として m/v に入る＝希少で難しい例が本来持つはずの
+                        # 大きな寄与を失う。1 step の総ノルム 1.0 を全分子で奪い合う
+                        # ゼロサム構造にもなる（巨大分子を押すと小分子が痩せる）。
                         gnorm = nn.utils.clip_grad_norm_(
                             list(self.cond_encoder.parameters()) + list(self.vae.parameters()),
                             self.args.grad_clip,
@@ -705,9 +712,8 @@ class VAETrainer:
                       f'alloc={torch.cuda.max_memory_allocated()/1e9:.2f}GB '
                       f'reserved={torch.cuda.max_memory_reserved()/1e9:.2f}GB',
                       flush=True)
-            # clipped が常時 ~100% だと実効 LR = grad_clip/||g|| 倍に縮み、
-            # 名目 LR スケジュールが効かない。幅・深さを変えた比較では ||g|| も
-            # 変わるので、条件間でこの行を必ず突き合わせる。
+            # clipped が常時 ~100% だと optimizer には単位ノルムの g/||g|| しか
+            # 渡らず、step 間の勾配の大小が消える（詳細は clip 実行箇所のコメント）。
             if is_main_process() and self._gnorm_n > 0:
                 print(f'[GNORM] ep{epoch} '
                       f'mean={self._gnorm_sum/self._gnorm_n:.3f} '
