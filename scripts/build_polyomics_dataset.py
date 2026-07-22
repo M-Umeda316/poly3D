@@ -7,31 +7,50 @@ PolyOmics の各 `<uuid>_eq.json`（1 非晶質セル = 同一繰返し単位の
 キモは「同一 SMILES に対する多数の非晶質配座」がそのまま学習アンサンブルになること
 （実測: 1 セルで同一単位 ~180 配座、重原子 GetBestRMS 中央値 ~3 A の広がり）。
 
-ソースは全て**ストリーム**で読むので tar.gz をローカルに溜め込まない:
-  - URL   :  https://huggingface.co/datasets/yhayashi1986/PolyOmics/resolve/main/MD_snapshot_JSON/<CLASS>.tar.gz
-  - ローカル tar.gz / 単一 _eq.json も可（smoke 用）。
+--------------------------------------------------------------------------------
+必要なデータ（「tar.gz と csv があればいい？」への答え）:
+  * tar.gz だけで学習用 lmdb は作れる。構造 JSON(commonchem) に原子/結合/3D座標/
+    残基タグが全部入っており、繰返し単位の SMILES は切り出した単位から RDKit で
+    導出する（--csv 不要）。
+  * CSV は任意。UUID 列で <uuid>_eq.json と結合でき、正式なポリマー SMILES
+    (smiles_list) や物性(temp/tacticity/QM記述子…)を各レコードに付与したいときだけ
+    --csv で渡す（物性条件付け・フィルタ用）。無くても学習は可能。
+--------------------------------------------------------------------------------
+
+ソースの与え方（オンライン/オフライン両対応。ローカル指定なら完全オフライン動作）:
+  --data_dir <DIR>   … DIR 直下の *.tar.gz を全処理（--classes で名前フィルタ）。← オフライン
+  --sources <...>    … URL / ローカル tar.gz / 単一 _eq.json / グロブ（複数可）。
 
 例:
-  # PG クラスを HF から直接ストリームして lmdb 化（各セル 3 単位ごとに間引き）
+  # 完全オフライン: ダウンロード済み MD_snapshot_JSON フォルダを丸ごと
+  python scripts/build_polyomics_dataset.py \
+      --data_dir D:/PolyOmics/MD_snapshot_JSON \
+      --out_path data/polyomics_all.lmdb --per_cell_stride 3 --max_atoms 288 --map_size_gb 40
+
+  # オフライン + 一部クラス + 物性CSV結合
+  python scripts/build_polyomics_dataset.py \
+      --data_dir D:/PolyOmics/MD_snapshot_JSON --classes PG PI PEST \
+      --csv D:/PolyOmics/general_polymers_with_sp_abbe_dynamic-dielectric.csv \
+      --csv_cols smiles_list temp tacticity \
+      --out_path data/polyomics_sub.lmdb
+
+  # オンライン: HF から直接ストリーム（全DL不要）
   python scripts/build_polyomics_dataset.py \
       --sources https://huggingface.co/datasets/yhayashi1986/PolyOmics/resolve/main/MD_snapshot_JSON/PG.tar.gz \
-      --out_path data/polyomics_PG.lmdb --per_cell_stride 3 --max_atoms 288
-
-  # ローカル 1 ファイルで smoke
-  python scripts/build_polyomics_dataset.py --sources <path>/xxxx_eq.json --out_path /tmp/smoke.lmdb
+      --out_path data/polyomics_PG.lmdb
 """
 from __future__ import annotations
 
 import argparse
-import io
+import csv as csvmod
+import glob
 import json
 import pickle
-import sys
 import tarfile
 import urllib.request
 from collections import defaultdict, Counter
 from pathlib import Path
-from typing import Iterator, Tuple
+from typing import Iterator, Optional, Tuple
 
 import lmdb
 import numpy as np
@@ -147,36 +166,91 @@ def _find_box(o):
     return None
 
 
+# ── ソース展開（--data_dir / --sources → 具体的なソース列） ─────────────────────
+
+def expand_sources(data_dir: Optional[str], sources, classes) -> list:
+    out = []
+    if data_dir:
+        out += sorted(glob.glob(str(Path(data_dir) / '*.tar.gz')))
+    for s in (sources or []):
+        # ローカルグロブは展開、URL やそのままのパスはスルー
+        if any(ch in s for ch in '*?[') and not s.startswith('http'):
+            out += sorted(glob.glob(s))
+        else:
+            out.append(s)
+    if classes:
+        cset = set(classes)
+        # tar.gz のみクラス名（拡張子除いた stem）でフィルタ。URL/json はそのまま残す
+        def keep(p):
+            name = Path(p).name
+            if name.endswith('.tar.gz'):
+                return name[:-len('.tar.gz')] in cset
+            return True
+        out = [p for p in out if keep(p)]
+    return out
+
+
 # ── ソース（URL / ローカル tar.gz / 単一 json）を (uuid, cell_dict) で yield ──────
 
 def iter_cells(source: str, max_cells: int = 0) -> Iterator[Tuple[str, dict]]:
     n = 0
-    if source.endswith('_eq.json') or (source.endswith('.json') and 'tar' not in source):
+    if source.endswith('.json') and not source.endswith('.tar.gz'):
         uuid = Path(source).stem.replace('_eq', '')
         with open(source, encoding='utf-8') as f:
             yield uuid, json.load(f)
         return
     # tar.gz（URL or ローカル）をストリーム展開
     if source.startswith('http://') or source.startswith('https://'):
-        fobj = urllib.request.urlopen(source)  # 302→CDN 自動追従
+        fobj = urllib.request.urlopen(source)  # 302→CDN 自動追従（オンライン時のみ）
     else:
-        fobj = open(source, 'rb')
-    with tarfile.open(fileobj=fobj, mode='r|gz') as tar:
-        for member in tar:
-            if not member.isfile() or not member.name.endswith('.json'):
+        fobj = open(source, 'rb')              # ローカル = 完全オフライン
+    try:
+        with tarfile.open(fileobj=fobj, mode='r|gz') as tar:
+            for member in tar:
+                if not member.isfile() or not member.name.endswith('.json'):
+                    continue
+                data = tar.extractfile(member).read()  # stream モードは前進前に読み切る
+                uuid = Path(member.name).stem.replace('_eq', '')
+                yield uuid, json.loads(data)
+                n += 1
+                if max_cells and n >= max_cells:
+                    break
+    finally:
+        fobj.close()
+
+
+# ── 任意: 物性CSV（UUID 結合）─────────────────────────────────────────────────
+
+def load_csv_map(paths, cols) -> dict:
+    """UUID → {col: value} を複数 CSV から構築。UUID 列は必須（PolyOmics CSV の 1列目）。"""
+    m: dict = {}
+    want = set(cols) if cols else {'smiles_list'}
+    for p in paths:
+        with open(p, newline='', encoding='utf-8') as f:
+            r = csvmod.DictReader(f)
+            if 'UUID' not in (r.fieldnames or []):
+                print(f'  [csv] {p}: UUID 列なし → スキップ')
                 continue
-            data = tar.extractfile(member).read()  # stream モードは前進前に読み切る
-            uuid = Path(member.name).stem.replace('_eq', '')
-            yield uuid, json.loads(data)
-            n += 1
-            if max_cells and n >= max_cells:
-                break
-    fobj.close()
+            avail = [c for c in want if c in r.fieldnames]
+            for row in r:
+                u = row['UUID']
+                if u:
+                    m[u] = {c: row.get(c) for c in avail}
+    print(f'  [csv] {len(m):,} UUID を読み込み（列: {sorted(want)}）')
+    return m
 
 
 # ── ビルド ────────────────────────────────────────────────────────────────────
 
 def build(args) -> None:
+    srcs = expand_sources(args.data_dir, args.sources, args.classes)
+    if not srcs:
+        raise SystemExit('ソースが空です（--data_dir か --sources を指定）')
+    print(f'sources ({len(srcs)}):')
+    for s in srcs:
+        print('  -', s)
+    csv_map = load_csv_map(args.csv, args.csv_cols) if args.csv else {}
+
     out = Path(args.out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     env = lmdb.open(str(out), map_size=args.map_size_gb * 1024 ** 3,
@@ -186,9 +260,10 @@ def build(args) -> None:
     n_ok = 0
     n_cells = 0
     skip = Counter()
-    for source in args.sources:
+    for source in srcs:
         for uuid, cell in iter_cells(source, max_cells=args.max_cells_per_class):
             n_cells += 1
+            props = csv_map.get(uuid)
             for u, (tag, mol) in enumerate(cut_units_from_cell(cell)):
                 if args.per_cell_stride > 1 and (u % args.per_cell_stride) != 0:
                     continue
@@ -200,6 +275,8 @@ def build(args) -> None:
                 except Exception as e:
                     skip[f'mol_to_data:{type(e).__name__}'] += 1
                     continue
+                if props:  # 任意: CSV 由来の物性/正式SMILESを付与（ConformerDataset は無視）
+                    dd['csv'] = props
                 txn.put(f'{n_ok:09d}'.encode('ascii'), pickle.dumps(dd))
                 n_ok += 1
                 if n_ok % 10_000 == 0:
@@ -216,9 +293,17 @@ def build(args) -> None:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description='PolyOmics 平衡化構造 → poly3d 処理済み lmdb')
-    p.add_argument('--sources', nargs='+', required=True,
-                   help='tar.gz の URL / ローカルパス / 単一 _eq.json（複数可）')
+    p = argparse.ArgumentParser(description='PolyOmics 平衡化構造 → poly3d 処理済み lmdb（オフライン対応）')
+    p.add_argument('--data_dir', default=None,
+                   help='ローカルの MD_snapshot_JSON フォルダ（直下の *.tar.gz を全処理）＝オフライン')
+    p.add_argument('--sources', nargs='+', default=None,
+                   help='URL / ローカル tar.gz / 単一 _eq.json / グロブ（複数可）')
+    p.add_argument('--classes', nargs='+', default=None,
+                   help='tar.gz のクラス名でフィルタ（例: PG PI PEST）')
+    p.add_argument('--csv', nargs='+', default=None,
+                   help='任意: 物性CSV（UUID 結合）。無くても学習 lmdb は作れる')
+    p.add_argument('--csv_cols', nargs='+', default=None,
+                   help='CSV から付与する列（既定 smiles_list）。例: smiles_list temp tacticity')
     p.add_argument('--out_path', required=True)
     p.add_argument('--per_cell_stride', type=int, default=1,
                    help='1 セル内で単位を N 個ごとに間引く（配座相関を減らしつつ容量抑制）')
