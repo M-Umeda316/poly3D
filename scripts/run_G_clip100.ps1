@@ -70,12 +70,15 @@
 # ~10h (hidden128 is ~2x faster per epoch than E's hidden256). Do not run other
 # GPU jobs alongside it (past OOM lesson).
 #
-# REPORTING (no need to copy files back): paste back
-#   1) runs/gen_v1/G_gnorm.log             (auto-built ASCII summary: the per-epoch
-#      [GNORM] lines. CHECK THIS FIRST - if clipped is still ~100%, ignore the rest)
-#   2) runs/gen_v1/G_clip100/vae_log.csv   (per-epoch train/val loss)
-#   3) runs/gen_v1/G_eval.log              (size-binned + endpoint tables, BOTH the
-#      "LARGE-MOLECULE EVAL" and the "VAL SAMPLE EVAL" section = main distribution)
+# REPORTING (nothing to copy back, and nothing long to hand-type):
+#   1) runs/gen_v1/G_gnorm.log   <- CHECK FIRST. Auto-built ASCII summary holding
+#      the per-epoch [GNORM] lines, which epoch vae_best.pt is, and the [OOM] count.
+#      If clipped is still ~100%, or [OOM] > 0, the eval below is meaningless.
+#   2) the 3-line delta table vs run_C:
+#        python scripts/cmp_runs.py runs/gen_v1/cmp_C_large.json runs/gen_v1/cmp_G_large.json
+#        python scripts/cmp_runs.py runs/gen_v1/cmp_C_valgen.json runs/gen_v1/cmp_G_valgen.json
+#      (add --full for p90 / bond / e2e_ratio). Full tables stay in G_eval.log.
+#   3) runs/gen_v1/G_clip100/vae_log.csv   (per-epoch train/val loss)
 # --------------------------------------------------------------------------------
 
 param(
@@ -177,6 +180,42 @@ if (Test-Path "$base/G_out.log") {
     if ($hits) { $hits | Out-File -Append -Encoding ascii $summary }
     else { "(no [GNORM] ep lines -- is train.py at commit 2a294ae or later?)" |
            Out-File -Append -Encoding ascii $summary }
+
+    # --- Which epoch is vae_best.pt? -----------------------------------------
+    # This bit us on run_E and we did not notice for days: vae_best.pt is the
+    # MINIMUM val_total, not the last epoch. E diverged after ep7 and never beat
+    # it again, so E's "40 epoch" eval was silently an EPOCH 7 model. If G's best
+    # is early, the same trap is live: the eval below is NOT the converged model.
+    "" | Out-File -Append -Encoding ascii $summary
+    $bestEp = & $py -c "import torch,sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['epoch'])" "$outG/vae_best.pt" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        "vae_best.pt = epoch $bestEp of 40  (eval below uses THIS checkpoint)" |
+            Out-File -Append -Encoding ascii $summary
+        if ([int]($bestEp | Select-Object -Last 1) -lt 30) {
+            "  ^ WARNING: best is early => the run likely diverged and never recovered" |
+                Out-File -Append -Encoding ascii $summary
+            "    (exactly what run_E did: best=ep7, then 33 epochs of no improvement)" |
+                Out-File -Append -Encoding ascii $summary
+        }
+    }
+
+    # --- Were any batches silently dropped? ----------------------------------
+    # train.py's OOM handler skips the offending batch and continues. The batches
+    # that OOM are the HEAVIEST = the ones holding the 240+ giants = precisely the
+    # signal this run exists to measure. Any hit here biases the result against the
+    # hypothesis, so the run must be treated as contaminated.
+    $oom = @(Select-String -Path "$base/G_out.log" -Pattern '\[OOM\]')
+    "" | Out-File -Append -Encoding ascii $summary
+    if ($oom.Count -gt 0) {
+        "*** [OOM] skipped batches: $($oom.Count) -- RESULT IS CONTAMINATED ***" |
+            Out-File -Append -Encoding ascii $summary
+        "    Dropped batches are the heaviest = the 240+ giants = what we measure." |
+            Out-File -Append -Encoding ascii $summary
+        "    Re-run on a box with VRAM headroom (or bs4 x ga8, eff 32 unchanged)." |
+            Out-File -Append -Encoding ascii $summary
+    } else {
+        "[OOM] skipped batches: 0  (clean)" | Out-File -Append -Encoding ascii $summary
+    }
 }
 Get-Content $summary | Write-Host
 
