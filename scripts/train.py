@@ -227,6 +227,23 @@ def parse_args() -> argparse.Namespace:
                    help='混合精度 (bf16) を無効化。デフォルト: AMP 有効')
     p.add_argument('--grad_accum', type=int, default=1,
                    help='勾配累積ステップ数。実効 batch_size = batch_size × grad_accum')
+    p.add_argument('--oom_max_skips', type=int, default=0,
+                   help='単一GPU時、OOM でバッチを破棄して継続することを許す回数'
+                        '（0=初回 OOM で即停止＝fail-fast, 既定）。破棄されるのは'
+                        '常に最も重いバッチ＝巨大分子(240+)を含むバッチ＝サイズ別'
+                        '評価で測ろうとしている当の信号なので、握りつぶすと実験が'
+                        '静かに歪む。save_every 1 なら再起動で直前 epoch から '
+                        'resume できるので停止コストは小さい。DDP は従来どおり'
+                        '常に即 raise（NCCL ハング回避）。stage=vae のみ有効。')
+    p.add_argument('--warmup_steps', type=int, default=0,
+                   help='LR warmup の長さ（**optimizer step** 単位。0=無効＝完全後方'
+                        '互換）。lr を warmup_start_factor 倍から線形に定格 lr へ'
+                        '上げる。epoch 単位でなく step 単位なのは、幅256で実測した'
+                        '勾配爆発が最初の ~40 optimizer step で起きるため（epoch '
+                        '単位では 1 epoch = 数千 step で粗すぎて効かない）。'
+                        'stage=vae のみ有効。')
+    p.add_argument('--warmup_start_factor', type=float, default=0.01,
+                   help='warmup 開始時の lr 倍率（--warmup_steps > 0 のときのみ）。')
     p.add_argument('--gnorm_log_every', type=int, default=0,
                    help='N optimizer step ごとに [GNORM] 行（クリップ前の勾配ノルム・'
                         'クリップ率）を出力（0=無効, epoch 毎の集計は常に出力）。'
@@ -386,8 +403,21 @@ class VAETrainer:
         self.start_epoch = 1
         self.best_val_loss = float('inf')
         self.global_step = 0
+        # LR warmup 用。opt_step は optimizer.step() の通算回数（global_step は
+        # tb_log_every 刻みで進む別物なので流用不可）。_sched_lrs は「その epoch で
+        # scheduler が設定した lr」＝ warmup のスケール基準。
+        self.opt_step = 0
+        self._sched_lrs: Optional[list] = None
+        # OOM で破棄したバッチ数（run 通算。epoch ごとにリセットしない＝1件でも
+        # 出たらサイズ別評価は汚染されているため）。
+        self._oom_skips = 0
         if args.resume:
             self._load(args.resume)
+
+        if is_main_process() and args.warmup_steps > 0:
+            print(f'LR warmup: {args.warmup_steps} optimizer step かけて '
+                  f'lr {args.lr * args.warmup_start_factor:.2e} → {args.lr:.2e} '
+                  f'（開始 opt_step={self.opt_step}）')
 
         # TensorBoard（main process のみ）
         self.writer: Optional[SummaryWriter] = None
@@ -475,6 +505,24 @@ class VAETrainer:
         progress = min(1.0, (epoch - 1) / a.beta_warmup_epochs)
         return a.beta_start + (a.beta_end - a.beta_start) * progress
 
+    def _apply_warmup(self) -> None:
+        """LR warmup（opt-in, --warmup_steps > 0 のみ）。
+
+        基準 (_sched_lrs) は「その epoch 頭に scheduler が設定した lr」。そこに
+        線形の倍率を掛けるだけで、cosine 本体には一切触らない。opt_step ==
+        warmup_steps でちょうど倍率 1.0（＝定格 lr）に着地し、以降は何もしない。
+
+        warmup_steps=0 なら即 return ＝ param_group['lr'] を一度も書き換えない
+        ので、既存ランと**ビット単位で同一**。
+        """
+        w = self.args.warmup_steps
+        if w <= 0 or self._sched_lrs is None or self.opt_step > w:
+            return
+        f = self.args.warmup_start_factor
+        scale = f + (1.0 - f) * (self.opt_step / w)
+        for g, base in zip(self.optimizer.param_groups, self._sched_lrs):
+            g['lr'] = base * scale
+
     def _load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         _unwrap(self.cond_encoder).load_state_dict(ckpt['cond_encoder'])
@@ -484,6 +532,8 @@ class VAETrainer:
         self.start_epoch = ckpt['epoch'] + 1
         self.best_val_loss = ckpt.get('val_loss', float('inf'))
         self.global_step = ckpt.get('global_step', 0)
+        # 旧 ckpt には無い → 0。warmup 無しで作られた ckpt なので 0 で正しい。
+        self.opt_step = ckpt.get('opt_step', 0)
         if is_main_process():
             print(f'Resume: {path} (epoch {ckpt["epoch"]}, step {self.global_step})')
 
@@ -498,6 +548,7 @@ class VAETrainer:
             'scheduler': self.scheduler.state_dict(),
             'val_loss': val_loss,
             'global_step': self.global_step,
+            'opt_step': self.opt_step,
             'args': vars(self.args),
         }
         torch.save(ckpt, self.out_dir / f'vae_epoch{epoch:04d}.pt')
@@ -523,6 +574,8 @@ class VAETrainer:
         self._gnorm_clipped = 0
 
         if train:
+            # warmup のスケール基準＝この epoch の scheduler 設定値を退避。
+            self._sched_lrs = [g['lr'] for g in self.optimizer.param_groups]
             self.optimizer.zero_grad(set_to_none=True)
 
         # stderr がファイル等の非TTYへリダイレクトされている場合はバーを自動無効化
@@ -614,25 +667,30 @@ class VAETrainer:
                         self._gnorm_sum += float(gnorm)
                         self._gnorm_n += 1
                         self._gnorm_clipped += int(float(gnorm) > self.args.grad_clip)
+                        self.opt_step += 1
+                        self._apply_warmup()
                         # step 単位でも出す（epoch 単位だけだと幅256で1行27分かかり、
-                        # 短時間プローブができない）。0=無効。
+                        # 短時間プローブができない）。0=無効。lr も出すのは warmup が
+                        # 実際に効いているかをここで検証するため。
                         if (is_main_process() and self.args.gnorm_log_every > 0
                                 and self._gnorm_n % self.args.gnorm_log_every == 0):
                             print(f'[GNORM] optstep{self._gnorm_n} '
                                   f'norm={float(gnorm):.3f} '
                                   f'mean={self._gnorm_sum/self._gnorm_n:.3f} '
                                   f'clip={self.args.grad_clip} '
-                                  f'clipped={100*self._gnorm_clipped/self._gnorm_n:.1f}%',
+                                  f'clipped={100*self._gnorm_clipped/self._gnorm_n:.1f}% '
+                                  f'lr={self.optimizer.param_groups[0]["lr"]:.2e}',
                                   flush=True)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
             except (torch.cuda.OutOfMemoryError, torch.AcceleratorError) as e:
                 if not isinstance(e, torch.cuda.OutOfMemoryError) and 'out of memory' not in str(e).lower():
                     raise
-                # 巨大分子バッチで一時的に VRAM 不足 → 勾配を捨ててスキップし学習継続
+                n_atoms = int(batch.pos.size(0)) if 'batch' in locals() and batch is not None else -1
+                self._oom_skips += 1
                 if is_main_process():
-                    n_atoms = int(batch.pos.size(0)) if 'batch' in locals() and batch is not None else -1
-                    print(f'[OOM] epoch skip step={step} n_atoms={n_atoms} — バッチを破棄')
+                    print(f'[OOM] step={step} n_atoms={n_atoms} — バッチを破棄'
+                          f'（この run で {self._oom_skips} 件目）')
                 self.optimizer.zero_grad(set_to_none=True)
                 # autograd graph を保持する中間テンソルを全て解放
                 batch = None
@@ -657,6 +715,27 @@ class VAETrainer:
                 # メモリ解放後に元例外を re-raise する。シングル GPU では従来通り continue。
                 if dist.is_initialized() and dist.get_world_size() > 1:
                     raise
+                # 単一 GPU: fail-fast（既定 --oom_max_skips 0）。
+                # 握りつぶして continue すると、捨てられるのは必ず「最も重い
+                # バッチ」＝巨大分子(240+)を含むバッチ＝サイズ別評価で我々が測ろう
+                # としている当の信号。静かに間引かれた結果は「240+ は改善しなかった」
+                # と読めてしまい、実験が仮説に不利な方向へサイレントに歪む。
+                # 実害の前例: run_D は wedged allocator のまま 2.5h・132,286 行の
+                # OOM スキップを空回りし、1 epoch も完了せず終わった。
+                # save_every 1 なら再起動で直前 epoch から resume できるので、
+                # 落ちるコストは小さい（黙って壊れた結果を出すより遥かに安い）。
+                if self._oom_skips > self.args.oom_max_skips:
+                    raise RuntimeError(
+                        f'OOM でバッチを破棄しました（step={step}, '
+                        f'n_atoms={n_atoms}, この run で {self._oom_skips} 件目）。'
+                        f'--oom_max_skips={self.args.oom_max_skips} を超えたので停止します。\n'
+                        f'  破棄されるのは最も重い＝巨大分子を含むバッチなので、'
+                        f'続行するとサイズ別評価が静かに歪みます。\n'
+                        f'  対処: --batch_size を半分かつ --grad_accum を倍'
+                        f'（実効 batch 維持＝比較性は保たれる）／'
+                        f'--empty_cache_every を小さく／VRAM に余裕のある機で。\n'
+                        f'  save_every 1 なら再起動で直前 epoch から resume されます。'
+                    ) from e
                 continue
 
             # detach テンソル → float 変換（バッチ末でまとめて sync）
@@ -723,6 +802,14 @@ class VAETrainer:
 
             run_val = (epoch % self.args.val_every == 0) or (epoch == self.args.epochs)
             va = self._run_epoch(self.val_loader, False, beta) if run_val else {}
+            # warmup 中は param_group['lr'] を書き換えているので、scheduler が
+            # 自分の設定値を読めるよう必ず戻してから step する。
+            # CosineAnnealingLR.get_lr() は group['lr'] から**再帰的に**次の lr を
+            # 計算するため、書き換えたまま step するとコサイン曲線自体が壊れる。
+            # warmup 無効時は _sched_lrs == 現在値なので代入は no-op（＝挙動不変）。
+            if self._sched_lrs is not None:
+                for g, base in zip(self.optimizer.param_groups, self._sched_lrs):
+                    g['lr'] = base
             self.scheduler.step()
 
             if is_main_process():
