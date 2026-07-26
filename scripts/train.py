@@ -67,6 +67,25 @@ from poly3d.model.flow_matching import FlowMatching
 from poly3d.model.vae_loss import vae_loss
 
 
+# ── vdW 半径テーブル（clash 損失用） ───────────────────────────────────────────
+_RVDW_TABLE: Optional[torch.Tensor] = None
+
+
+def get_rvdw_table(device: torch.device, max_z: int = 100) -> torch.Tensor:
+    """原子番号 Z でインデックスする van der Waals 半径テーブル（(max_z,) float32）。
+
+    eval_ensemble の妥当性ゲートと同じ RDKit GetRvdw を使うことで clash 判定を一致させる。
+    プロセス内で 1 回だけ構築してキャッシュ（デバイスが変われば作り直す）。index 0 は未使用。
+    """
+    global _RVDW_TABLE
+    if _RVDW_TABLE is None or _RVDW_TABLE.device != device:
+        from rdkit import Chem
+        pt = Chem.GetPeriodicTable()
+        vals = [0.0] + [float(pt.GetRvdw(z)) for z in range(1, max_z)]
+        _RVDW_TABLE = torch.tensor(vals, dtype=torch.float32, device=device)
+    return _RVDW_TABLE
+
+
 # ── 分散学習ユーティリティ ─────────────────────────────────────────────────────
 
 def init_dist() -> tuple[int, int, int]:
@@ -192,6 +211,16 @@ def parse_args() -> argparse.Namespace:
                    help='multiscale_distmat の long-range 距離損失重み')
     p.add_argument('--local_cutoff', type=float, default=5.0,
                    help='local_distmat の近接ペア閾値（Å）')
+    # clash（立体衝突）ガードレール損失。eval の妥当性ゲートの clash 判定を鏡写しにする。
+    p.add_argument('--w_clash', type=float, default=0.0,
+                   help='clash ガードレール損失の重み（0=無効・後方互換）。'
+                        'グラフ距離>=3 のペアが (rvdw_i+rvdw_j)*clash_factor に食い込んだ量を罰する')
+    p.add_argument('--clash_factor', type=float, default=0.6,
+                   help='clash 閾値係数（eval の妥当性ゲートと合わせ 0.6）')
+    p.add_argument('--clash_min_graph_dist', type=int, default=3,
+                   help='clash 対象とみなすグラフ距離の下限（eval と合わせ 3）')
+    p.add_argument('--clash_max_pairs', type=int, default=512,
+                   help='clash 損失で 1 分子あたりサンプリングする最大ペア数')
     p.add_argument('--mds_init', action='store_true', default=False,
                    help='デコーダの初期座標に MDS 大域足場（トポロジー由来）を用いる。'
                         '0=無効（後方互換、per-atom MLP のみ）')
@@ -219,6 +248,11 @@ def parse_args() -> argparse.Namespace:
                    help='DataLoader ワーカー数。Ryzen9 7900X: 8-10、Xeon 8558: 16-20 推奨')
     p.add_argument('--save_every', type=int, default=10)
     p.add_argument('--resume', type=str, default=None)
+    p.add_argument('--init_weights', type=str, default=None,
+                   help='チェックポイントから cond_encoder + vae の重みだけを読み込んで'
+                        '学習を新規開始する（optimizer/scheduler/epoch は fresh）。'
+                        '既存モデルを土台に別の損失・LRで fine-tune する用途。'
+                        '--resume が指定された場合はそちらが優先される（本フラグは無視）')
     p.add_argument('--device', type=str, default='auto')
     p.add_argument('--seed', type=int, default=42)
 
@@ -413,6 +447,8 @@ class VAETrainer:
         self._oom_skips = 0
         if args.resume:
             self._load(args.resume)
+        elif args.init_weights:
+            self._load_weights_only(args.init_weights)
 
         if is_main_process() and args.warmup_steps > 0:
             print(f'LR warmup: {args.warmup_steps} optimizer step かけて '
@@ -523,6 +559,17 @@ class VAETrainer:
         for g, base in zip(self.optimizer.param_groups, self._sched_lrs):
             g['lr'] = base * scale
 
+    def _load_weights_only(self, path: str):
+        """cond_encoder + vae の重みだけを読み込み、optimizer/scheduler/epoch は fresh の
+        まま学習を新規開始する（別損失・別 LR での warm-start / fine-tune 用）。"""
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        _unwrap(self.cond_encoder).load_state_dict(ckpt['cond_encoder'])
+        _unwrap(self.vae).load_state_dict(ckpt['vae'])
+        if is_main_process():
+            print(f'重みのみロード（fine-tune 起点）: {path} '
+                  f'(元 epoch={ckpt.get("epoch", "?")}, val_loss={ckpt.get("val_loss", "?")}) '
+                  f'→ optimizer/scheduler/epoch は fresh で開始')
+
     def _load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         _unwrap(self.cond_encoder).load_state_dict(ckpt['cond_encoder'])
@@ -624,11 +671,18 @@ class VAETrainer:
                             pos_loss_type=self.args.pos_loss_type,
                             local_cutoff=self.args.local_cutoff,
                             batch=batch.batch,
-                            # multiscale_distmat の long-range 項に必要
+                            # multiscale_distmat の long-range 項・clash 項に必要
                             dist_mat=getattr(batch, 'dist_mat', None),
                             ptr=getattr(batch, 'ptr', None),
                             w_local=self.args.w_local,
                             w_global=self.args.w_global,
+                            # clash ガードレール損失
+                            w_clash=self.args.w_clash,
+                            rvdw=(get_rvdw_table(self.device)[batch.atomic_nums]
+                                  if self.args.w_clash > 0.0 else None),
+                            clash_factor=self.args.clash_factor,
+                            clash_min_graph_dist=self.args.clash_min_graph_dist,
+                            clash_max_pairs=self.args.clash_max_pairs,
                         )
 
                 if train:
@@ -1308,6 +1362,16 @@ def _benchmark_vae(trainer: VAETrainer, n_batches: int):
                 pos_loss_type=trainer.args.pos_loss_type,
                 local_cutoff=trainer.args.local_cutoff,
                 batch=batch.batch,
+                dist_mat=getattr(batch, 'dist_mat', None),
+                ptr=getattr(batch, 'ptr', None),
+                w_local=trainer.args.w_local,
+                w_global=trainer.args.w_global,
+                w_clash=trainer.args.w_clash,
+                rvdw=(get_rvdw_table(device)[batch.atomic_nums]
+                      if trainer.args.w_clash > 0.0 else None),
+                clash_factor=trainer.args.clash_factor,
+                clash_min_graph_dist=trainer.args.clash_min_graph_dist,
+                clash_max_pairs=trainer.args.clash_max_pairs,
             )
         if use_cuda:
             torch.cuda.synchronize(device)

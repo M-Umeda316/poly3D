@@ -678,3 +678,105 @@ def longrange_distance_loss(
         mol_mean = mol_sum[has_pair] / mol_count[has_pair].float()
 
     return mol_mean.mean()
+
+
+def clash_loss(
+    pos_pred: Tensor,
+    dist_mat: Tensor,
+    rvdw: Tensor,
+    batch: Tensor,
+    ptr: Optional[Tensor] = None,
+    min_graph_dist: int = 3,
+    clash_factor: float = 0.6,
+    max_pairs: int = 512,
+) -> Tensor:
+    """
+    立体衝突（steric clash）ペナルティ = eval の妥当性ゲートの clash 判定を鏡写しにした損失。
+
+    妥当性ゲート（eval_ensemble.validity_of_conformer）は
+        「真に非結合なペア（グラフ距離 >= 3）で dist < (rvdw_i + rvdw_j) * clash_factor」
+    を 1 つでも持つ配座を fail とする。本損失はその閾値を下回った量（食い込み）だけを
+    ヒンジで罰する **ガードレール型** の損失で、閾値以上に離れているペアには一切勾配を
+    与えない（GT 参照配座はすべてゲートを通過＝食い込み 0 なので、再構築目標と衝突しない）。
+
+    `longrange_distance_loss` と同じく、全 (N,N) ペアは使わず分子ごとに `max_pairs` ペアを
+    棄却サンプリングし、`dist_mat`（ブロック対角・分子内 0-4）からグラフ距離を引いて
+    `min_graph_dist` 未満のペア（結合・1-3 幾何隣接）を除外する。分子内ローカル
+    インデックスで抽出するため分子間 off-block（far=4）は拾わない。
+
+    Parameters
+    ----------
+    pos_pred : (N, 3)  予測座標（勾配はここを通る）。pos_gt は使わない（絶対的な立体制約）
+    dist_mat : (N, N) int  ブロック対角グラフ距離行列（分子内 0-4, 4=far, clamp 済み）
+    rvdw     : (N,) float  原子ごとの van der Waals 半径（Å）。Z→GetRvdw で eval と一致させる
+    batch    : (N,) int  バッチ内の分子インデックス（連続・昇順; PyG Batch 準拠）
+    ptr      : (B+1,) int  分子境界。None の場合は batch から復元する
+    min_graph_dist : int  clash 対象とみなすグラフ距離の下限（eval と合わせ 3）
+    clash_factor   : float  閾値係数（eval と合わせ 0.6）
+    max_pairs      : int  1 分子あたりの最大サンプリングペア数
+
+    Returns
+    -------
+    scalar loss  (分子ごとの平均 clash エネルギー relu(thr - d)^2 の分子間平均)
+                 clash が無ければ 0。対象ペアが無い分子は 0 寄与でスキップ。
+    """
+    N = pos_pred.size(0)
+    if N == 0:
+        return pos_pred.new_zeros(())
+
+    device = pos_pred.device
+
+    if ptr is None:
+        counts = torch.bincount(batch)                              # (B,)
+        ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])    # (B+1,)
+    else:
+        counts = ptr[1:] - ptr[:-1]                                 # (B,)
+
+    B = counts.size(0)
+    if B == 0:
+        return pos_pred.new_zeros(())
+
+    starts = ptr[:-1]                          # (B,)
+    n_mol = counts.to(torch.float32)          # (B,)
+
+    # 分子ごとに max_pairs ペアをローカル一様サンプリング（棄却サンプリング）
+    rand_a = torch.rand(B, max_pairs, device=device)
+    rand_b = torch.rand(B, max_pairs, device=device)
+    ia = (rand_a * n_mol.unsqueeze(1)).long()
+    ib = (rand_b * n_mol.unsqueeze(1)).long()
+    max_local = (counts - 1).clamp(min=0).unsqueeze(1)
+    ia = torch.minimum(ia, max_local)
+    ib = torch.minimum(ib, max_local)
+
+    gi = (starts.unsqueeze(1) + ia).clamp(max=N - 1)   # (B, max_pairs) グローバル index
+    gj = (starts.unsqueeze(1) + ib).clamp(max=N - 1)
+
+    # 真のグラフ距離（同一分子内なので off-block を拾わない）
+    gd = dist_mat[gi.reshape(-1), gj.reshape(-1)].view(B, max_pairs)
+
+    # 有効ペア: グラフ距離 >= 閾値（真の非結合）かつ 自己ペアでない かつ 原子数 >= 2
+    valid = (gd >= min_graph_dist) & (ia != ib) & (counts.unsqueeze(1) >= 2)
+
+    # 距離と閾値（fp32 強制。bf16/fp16 の距離精度劣化を避ける）
+    device_type = device.type if device.type != 'cpu' else 'cpu'
+    with torch.autocast(device_type=device_type, enabled=False):
+        gi_flat = gi.reshape(-1)
+        gj_flat = gj.reshape(-1)
+        d_pred = (pos_pred.float()[gi_flat] - pos_pred.float()[gj_flat]).norm(dim=-1).view(B, max_pairs)
+        # 閾値 thr = (rvdw_i + rvdw_j) * clash_factor（勾配不要の定数）
+        rv = rvdw.float()
+        with torch.no_grad():
+            thr = (rv[gi_flat] + rv[gj_flat]).view(B, max_pairs) * clash_factor
+
+        # ヒンジ: 閾値を下回った食い込み量のみ罰する（それ以外は 0 勾配）
+        overlap = (thr - d_pred).clamp(min=0.0)          # (B, max_pairs)
+        pen = (overlap * overlap) * valid                # 無効ペアは 0
+
+        mol_count = valid.sum(dim=1)                      # (B,) 有効ペア数
+        has_pair = mol_count > 0
+        if not has_pair.any():
+            return pos_pred.new_zeros(())
+
+        mol_mean = pen.sum(dim=1)[has_pair] / mol_count[has_pair].float()
+
+    return mol_mean.mean()

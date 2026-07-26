@@ -27,7 +27,7 @@ from poly3d.model.geo_losses import (
     angle_loss, dihedral_loss,
     build_angle_triplets, build_dihedral_quartets,
     kabsch_rmsd_loss, dist_matrix_loss, local_distance_loss,
-    longrange_distance_loss,
+    longrange_distance_loss, clash_loss,
 )
 
 
@@ -96,6 +96,12 @@ def vae_loss(
     longrange_min_graph_dist: int = 4,
     longrange_max_pairs: int = 256,
     longrange_huber_delta: float = 1.0,
+    # clash（立体衝突）ガードレール損失。w_clash=0 で完全無効（後方互換）
+    w_clash: float = 0.0,
+    rvdw: Optional[Tensor] = None,
+    clash_factor: float = 0.6,
+    clash_min_graph_dist: int = 3,
+    clash_max_pairs: int = 512,
 ) -> Tuple[Tensor, dict]:
     """
     Parameters
@@ -160,7 +166,20 @@ def vae_loss(
     logvar_safe = logvar.clamp(-10.0, 10.0)
     l_kl = (-0.5 * (1 + logvar_safe - mu.pow(2) - logvar_safe.exp())).mean()
 
+    # clash（立体衝突）ガードレール: グラフ距離>=3 のペアが vdW 閾値に食い込んだ量を罰する。
+    # w_clash=0 / dist_mat 無 / rvdw 無 のいずれかで無効（後方互換）。
+    l_clash: Optional[Tensor] = None
+    if w_clash > 0.0 and dist_mat is not None and rvdw is not None:
+        l_clash = clash_loss(
+            pos_pred, dist_mat, rvdw, batch, ptr=ptr,
+            min_graph_dist=clash_min_graph_dist,
+            clash_factor=clash_factor,
+            max_pairs=clash_max_pairs,
+        )
+
     total = w_pos * l_pos + w_bond * l_bond + w_angle * l_angle + w_dihedral * l_dihedral
+    if l_clash is not None:
+        total = total + w_clash * l_clash
     # beta=0 のとき 0*NaN=NaN になるのを避けるため明示的にガード
     if beta > 0.0:
         total = total + beta * l_kl
@@ -179,4 +198,6 @@ def vae_loss(
     if l_pos_local is not None:
         loss_dict['pos_local'] = l_pos_local.detach()
         loss_dict['pos_global'] = l_pos_global.detach()
+    if l_clash is not None:
+        loss_dict['clash'] = l_clash.detach()
     return total, loss_dict
