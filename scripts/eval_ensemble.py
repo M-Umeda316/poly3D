@@ -311,6 +311,30 @@ def build_rdmol(atomic_nums: np.ndarray, edge_index: np.ndarray,
     return mol
 
 
+def atom_match_to_ref(mol_ref, atomic_nums: np.ndarray, edge_index: np.ndarray,
+                      bond_type_idx: np.ndarray, atom_cont: np.ndarray):
+    """conformer のトポロジーから mol を作り、mol_ref への原子対応 match を返す。
+
+    ★PolyOmics は同一 uuid でも配座ごとに原子ラベリングが異なる（対称な原子が
+    入れ替わる）。全指標は uuid 内で共有の topo（=mol_ref）の quartet/triplet/
+    bond/dist_mat/heavy_idx を使うため、各配座の座標を mol_ref の並びへ揃えない
+    と torsion/COV/TFD/clash が全て破綻する（conf0 の結合を別配座の座標に当てる
+    と 1.5Å→5.6Å に飛ぶことを実測確認）。RDKit 部分構造マッチで対応を取る。
+
+    戻り値: match（list, len == mol_ref の原子数, match[k]=この conformer 内で
+    mol_ref の原子 k に対応する index）。`pos[match]` で mol_ref の並びに揃う。
+    対称分子では自己同型が複数あるが任意の 1 つを取る（対称原子は化学的に等価
+    なので分布指標には影響しない）。mol 構築失敗・マッチ不成立時は None。
+    """
+    mj = build_rdmol(atomic_nums, edge_index, bond_type_idx, atom_cont)
+    if mj is None:
+        return None
+    match = mj.GetSubstructMatch(mol_ref)
+    if len(match) != mol_ref.GetNumAtoms():
+        return None
+    return list(match)
+
+
 def validity_of_conformer(pos: np.ndarray, rvdw: np.ndarray,
                           nonbond_mask: np.ndarray, bi: np.ndarray, bj: np.ndarray,
                           sanitize_ok: bool,
@@ -463,7 +487,21 @@ def evaluate_uuid(uuid: str, indices: list, ds: ConformerDataset,
     if len(R_datas) < 2:
         return None
 
+    # ── 参照フレーム（=基準ラベリング）の選定 ──
+    # ★同一 uuid でも配座ごとに原子ラベリングが異なるため、共有トポロジーを直接
+    #   使うと torsion/COV/clash が破綻する。最初に sanitize 可能な配座を topo に
+    #   選び、以降すべての配座（参照・生成）をこの topo の並びへリマップする。
+    rdmol = None
     topo = R_datas[0]
+    for d in R_datas:
+        m = build_rdmol(d.atomic_nums.cpu().numpy(), d.edge_index.cpu().numpy(),
+                        d.bond_type_idx.cpu().numpy(), d.atom_cont.cpu().numpy())
+        if m is not None:
+            rdmol = m
+            topo = d
+            break
+    sanitize_ok = rdmol is not None
+
     n_atoms = int(topo.num_nodes)
     edge_index_np = topo.edge_index.cpu().numpy()
     atomic_nums = topo.atomic_nums.cpu().numpy()
@@ -493,8 +531,26 @@ def evaluate_uuid(uuid: str, indices: list, ds: ConformerDataset,
 
     rvdw = np.array([_PT.GetRvdw(int(z)) for z in atomic_nums], dtype=np.float64)
 
-    # 参照座標（実 MD 配座）
-    R_pos = [d.pos.float() for d in R_datas]
+    def _match(d):
+        """d を topo フレームへ揃える match（list）。rdmol 無しは None（整列不能）。"""
+        if rdmol is None:
+            return None
+        return atom_match_to_ref(rdmol, d.atomic_nums.cpu().numpy(),
+                                 d.edge_index.cpu().numpy(),
+                                 d.bond_type_idx.cpu().numpy(),
+                                 d.atom_cont.cpu().numpy())
+
+    # ── 参照座標を topo フレームへリマップ（マッチ不成立は除外）──
+    R_pos = []
+    for d in R_datas:
+        mt = _match(d)
+        if mt is None:
+            if rdmol is None:
+                R_pos.append(d.pos.float())    # 整列不能（degenerate: 従来動作）
+            continue
+        R_pos.append(d.pos.float()[mt])
+    if len(R_pos) < 2:
+        return None
     R_stack = _stack_pos(R_pos)                      # (nr, n, 3)
 
     # ── 生成 ──
@@ -514,14 +570,23 @@ def evaluate_uuid(uuid: str, indices: list, ds: ConformerDataset,
             if k > 4 * n_gen:   # 念のための無限ループガード
                 break
 
-    G_pos_all = generate_positions(gen_datas, args.mode, cond_encoder, vae, flow,
+    # 生成前に各 gen_data の topo フレームへの match を確保（collate が topology を
+    # 破壊消費するため、生成呼び出しの前に読む）。
+    gen_matches = [_match(d) for d in gen_datas]
+
+    G_pos_raw = generate_positions(gen_datas, args.mode, cond_encoder, vae, flow,
                                    device, margs, args.batch_size, args.n_steps)
 
-    # ── 妥当性ゲート（G に適用、fail は分布/COV-MAT から除外）──
-    rdmol = build_rdmol(atomic_nums, edge_index_np,
-                        topo.bond_type_idx.cpu().numpy(), topo.atom_cont.cpu().numpy())
-    sanitize_ok = rdmol is not None
+    # 生成座標を topo フレームへリマップ（マッチ不成立は除外）
+    G_pos_all = []
+    for p, mt in zip(G_pos_raw, gen_matches):
+        if mt is None:
+            if rdmol is None:
+                G_pos_all.append(p)
+            continue
+        G_pos_all.append(p[mt])
 
+    # ── 妥当性ゲート（G に適用、fail は分布/COV-MAT から除外）──
     G_valid = []
     for p in G_pos_all:
         pn = p.cpu().numpy()
@@ -535,7 +600,7 @@ def evaluate_uuid(uuid: str, indices: list, ds: ConformerDataset,
         'uuid': uuid,
         'n_heavy': n_heavy,
         'n_atoms': n_atoms,
-        'n_ref': len(R_datas),
+        'n_ref': len(R_pos),
         'n_gen': n_gen_total,
         'n_gen_valid': len(G_valid),
         'n_fail': n_fail,
