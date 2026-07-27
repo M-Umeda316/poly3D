@@ -329,7 +329,8 @@ class StructuralVAE(nn.Module):
         dist_mat: Optional[Tensor] = None,
         init_scaffold: Optional[Tensor] = None,
         robust_noise_std: float = 0.0,
-    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
+        extra_latent: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
         """
         Returns
         -------
@@ -337,6 +338,7 @@ class StructuralVAE(nn.Module):
         mu          : (N, latent_dim)
         logvar      : (N, latent_dim)
         pos_robust  : (N, 3) or None  off-manifold 潜在 z' のデコード（後述）
+        pos_ditcons : (N, 3) or None  外部供給潜在（実 DiT 生成潜在）のデコード（後述）
 
         eval 時は encode が決定論デコード（z = mu）を返すため、forward も
         自動的に決定論的になる（同一入力→同一 pos_pred）。train 時は確率的。
@@ -354,6 +356,15 @@ class StructuralVAE(nn.Module):
         （clash + bond_range）だけを課し、「多少ずれた潜在でもデコーダが壊れない」
         ことを学習させる（DiT が生成する off-manifold 潜在への頑健化）。
         デフォルト 0.0・eval 時は pos_robust=None で完全後方互換。
+
+        extra_latent（DiT consistency, 任意）:
+        学習時かつ extra_latent が与えられたとき、その外部潜在（実 DiT が生成した
+        off-manifold 潜在を想定, (N, latent_dim)）を追加でデコードし pos_ditcons として
+        返す。等方ノイズ（robust）と違い、実 DiT 潜在は原子間で相関した構造的な
+        off-manifold 誤差を持つため、その潜在に直接ガードレール損失（clash+bond_range）
+        を課すことでデコーダを「実際に壊れやすい潜在」に対して鍛える。呼び出し側で
+        no_grad 生成・detach 済みの潜在を渡す想定（勾配はデコーダのみに流れる）。
+        デフォルト None・eval 時は pos_ditcons=None で完全後方互換。
         """
         z, mu, logvar = self.encode(cond, pos, edge_index, e_cond, batch, dist_mat)
         pos_pred = self.decode(z, cond, edge_index, e_cond, batch, dist_mat, init_scaffold)
@@ -365,5 +376,12 @@ class StructuralVAE(nn.Module):
             pos_robust = self.decode(
                 z_rob, cond, edge_index, e_cond, batch, dist_mat, init_scaffold
             )
-        return pos_pred, mu, logvar, pos_robust
+
+        # 外部供給潜在（実 DiT 生成潜在）のデコード（学習時のみ・GT 不要のガードレール損失用）
+        pos_ditcons: Optional[Tensor] = None
+        if self.training and extra_latent is not None:
+            pos_ditcons = self.decode(
+                extra_latent, cond, edge_index, e_cond, batch, dist_mat, init_scaffold
+            )
+        return pos_pred, mu, logvar, pos_robust, pos_ditcons
 

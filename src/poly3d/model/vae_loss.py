@@ -105,6 +105,9 @@ def vae_loss(
     # off-manifold ロバスト化ガードレール損失。w_robust=0 / pos_robust=None で完全無効（後方互換）
     pos_robust: Optional[Tensor] = None,
     w_robust: float = 0.0,
+    # DiT consistency ガードレール損失。w_ditcons=0 / pos_ditcons=None で完全無効（後方互換）
+    pos_ditcons: Optional[Tensor] = None,
+    w_ditcons: float = 0.0,
 ) -> Tuple[Tensor, dict]:
     """
     Parameters
@@ -193,11 +196,27 @@ def vae_loss(
             max_pairs=clash_max_pairs,
         ) + bond_range_loss(pos_robust, edge_index, batch, ptr=ptr)
 
+    # DiT consistency: 実 DiT 生成潜在のデコード出力 pos_ditcons に GT 不要のガードレール損失
+    # （clash + bond_range）のみを課す。等方ノイズ（robust）では覆えない、原子間で相関した
+    # 構造的な off-manifold 誤差を持つ「実際に壊れやすい潜在」に対してもデコーダが妥当な
+    # 幾何を出すよう鍛える。
+    # w_ditcons=0 / pos_ditcons=None / rvdw 無 / dist_mat 無 のいずれかで無効（後方互換）。
+    l_ditcons: Optional[Tensor] = None
+    if w_ditcons > 0.0 and pos_ditcons is not None and rvdw is not None and dist_mat is not None:
+        l_ditcons = clash_loss(
+            pos_ditcons, dist_mat, rvdw, batch, ptr=ptr,
+            min_graph_dist=clash_min_graph_dist,
+            clash_factor=clash_factor,
+            max_pairs=clash_max_pairs,
+        ) + bond_range_loss(pos_ditcons, edge_index, batch, ptr=ptr)
+
     total = w_pos * l_pos + w_bond * l_bond + w_angle * l_angle + w_dihedral * l_dihedral
     if l_clash is not None:
         total = total + w_clash * l_clash
     if l_robust is not None:
         total = total + w_robust * l_robust
+    if l_ditcons is not None:
+        total = total + w_ditcons * l_ditcons
     # beta=0 のとき 0*NaN=NaN になるのを避けるため明示的にガード
     if beta > 0.0:
         total = total + beta * l_kl
@@ -220,4 +239,6 @@ def vae_loss(
         loss_dict['clash'] = l_clash.detach()
     if l_robust is not None:
         loss_dict['robust'] = l_robust.detach()
+    if l_ditcons is not None:
+        loss_dict['ditcons'] = l_ditcons.detach()
     return total, loss_dict

@@ -231,6 +231,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--freeze_encoder', action='store_true', default=False,
                    help='cond_encoder と VAE エンコーダ部を凍結しデコーダのみ学習する。'
                         '潜在空間を保存し既存 DiT をそのまま使って新デコーダを評価するため')
+    # DiT consistency fine-tune（方針1b）。すべてデフォルト無効で完全後方互換。
+    p.add_argument('--w_ditcons', type=float, default=0.0,
+                   help='実 DiT 生成潜在をデコードした出力へのガードレール損失'
+                        '（clash+bond_range）の重み。0=無効（後方互換）。等方ノイズ'
+                        '（--w_robust）では覆えない、原子間で相関した構造的 off-manifold '
+                        '誤差を持つ実 DiT 潜在に対してデコーダを直接鍛える用途。'
+                        '--vae_dit_checkpoint の指定が必須。stage=vae のみ有効')
+    p.add_argument('--ditcons_steps', type=int, default=20,
+                   help='DiT consistency 用に flow.sample で潜在を生成する ODE ステップ数。'
+                        '毎バッチ生成するため短め（20 程度）を推奨')
+    p.add_argument('--vae_dit_checkpoint', type=str, default=None,
+                   help='DiT consistency（--w_ditcons>0）で潜在生成に使う凍結 DiT '
+                        'チェックポイント。DiT stage の --vae_checkpoint とは別軸で、'
+                        'VAE stage のデコーダ fine-tune 中に実 DiT 潜在を供給するためのもの')
     p.add_argument('--mds_init', action='store_true', default=False,
                    help='デコーダの初期座標に MDS 大域足場（トポロジー由来）を用いる。'
                         '0=無効（後方互換、per-atom MLP のみ）')
@@ -367,6 +381,25 @@ class VAETrainer:
             if is_main_process():
                 print('freeze_encoder: cond_encoder と vae.encoder を凍結'
                       '（decoder のみ学習・潜在空間 v3c を保存）')
+
+        # ── DiT consistency 用の凍結 DiT ロード（方針1b）─────────────────────
+        # w_ditcons>0 かつ --vae_dit_checkpoint 指定時のみ、実 DiT を凍結ロードして
+        # self.ditflow に保持する。学習ループでは毎バッチ no_grad で flow.sample し、
+        # その off-manifold 潜在をデコードしてガードレール損失をかける。
+        # 凍結・勾配不要なので DDP ラップは不要（各プロセスで独立にロードするだけ）。
+        self.ditflow = None
+        if args.w_ditcons > 0.0 and args.vae_dit_checkpoint:
+            dck = torch.load(args.vae_dit_checkpoint, map_location=self.device,
+                             weights_only=False)
+            dargs = argparse.Namespace(**dck['args'])
+            dit = build_dit(dargs).to(self.device)
+            dit.load_state_dict(dck['flow'])
+            self.ditflow = FlowMatching(dit, t_max=dargs.t_max)
+            self.ditflow.eval()
+            self.ditflow.requires_grad_(False)
+            if is_main_process():
+                print(f'DiT consistency: 凍結 DiT をロード {args.vae_dit_checkpoint} '
+                      f'（w_ditcons={args.w_ditcons}, ditcons_steps={args.ditcons_steps}）')
 
         # DDP ラップ（分散モード時のみ）
         # freeze_encoder 時: 完全凍結の cond_encoder は DDP ラップしない（勾配ゼロで
@@ -682,12 +715,33 @@ class VAETrainer:
                             lappe=getattr(batch, 'lappe', None),
                             batch=batch.batch,
                         )
-                        pos_pred, mu, logvar, pos_robust = self.vae(
+                        # DiT consistency（方針1b）: 実 DiT 生成潜在を no_grad で作り
+                        # extra_latent として渡す。等方ノイズと違い原子間で相関した構造的
+                        # off-manifold 潜在なので、これに直接ガードレールを課しデコーダを鍛える。
+                        # 生成は凍結 DiT（DDP 外）で勾配不要 → no_grad + detach。
+                        # cond は上で計算済みのものを再利用（二重計算しない）。
+                        if train and self.args.w_ditcons > 0.0 and self.ditflow is not None:
+                            with torch.no_grad():
+                                z_dit = self.ditflow.sample(
+                                    n_atoms=batch.num_nodes,
+                                    cond=cond,
+                                    batch=batch.batch,
+                                    n_steps=self.args.ditcons_steps,
+                                    edge_index=batch.edge_index,
+                                    device=self.device,
+                                    dist_mat=getattr(batch, 'dist_mat', None),
+                                ).detach()
+                        else:
+                            z_dit = None
+
+                        pos_pred, mu, logvar, pos_robust, pos_ditcons = self.vae(
                             cond, batch.pos, batch.edge_index, e_cond, batch.batch,
                             dist_mat=getattr(batch, 'dist_mat', None),
                             init_scaffold=getattr(batch, 'init_scaffold', None),
                             # off-manifold ロバスト化は学習時のみ（val は robust 損失を課さない）
                             robust_noise_std=(self.args.robust_noise_std if train else 0.0),
+                            # DiT consistency 潜在（train かつ w_ditcons>0 のときのみ非 None）
+                            extra_latent=z_dit,
                         )
 
                         num_nodes = batch.pos.size(0)
@@ -712,9 +766,10 @@ class VAETrainer:
                             w_global=self.args.w_global,
                             # clash ガードレール損失
                             w_clash=self.args.w_clash,
-                            # rvdw は clash / robust いずれかが有効なら必要
+                            # rvdw は clash / robust / ditcons いずれかが有効なら必要
                             rvdw=(get_rvdw_table(self.device)[batch.atomic_nums]
-                                  if (self.args.w_clash > 0.0 or self.args.w_robust > 0.0)
+                                  if (self.args.w_clash > 0.0 or self.args.w_robust > 0.0
+                                      or self.args.w_ditcons > 0.0)
                                   else None),
                             clash_factor=self.args.clash_factor,
                             clash_min_graph_dist=self.args.clash_min_graph_dist,
@@ -723,6 +778,9 @@ class VAETrainer:
                             # （edge_index は上で位置引数として渡し済み。bond_range_loss で再利用）
                             pos_robust=pos_robust,
                             w_robust=self.args.w_robust,
+                            # DiT consistency ガードレール損失（実 DiT 潜在のデコード出力）
+                            pos_ditcons=pos_ditcons,
+                            w_ditcons=self.args.w_ditcons,
                         )
 
                 if train:
@@ -1381,7 +1439,7 @@ def _benchmark_vae(trainer: VAETrainer, n_batches: int):
         # ── VAE forward ──
         with torch.autocast(device_type=device.type, dtype=trainer.amp_dtype,
                             enabled=trainer.amp_enabled):
-            pos_pred, mu, logvar, _ = trainer.vae(
+            pos_pred, mu, logvar, _, _ = trainer.vae(
                 cond, batch.pos, batch.edge_index, e_cond, batch.batch
             )
         if use_cuda:
