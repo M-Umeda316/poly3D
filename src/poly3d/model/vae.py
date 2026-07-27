@@ -328,13 +328,15 @@ class StructuralVAE(nn.Module):
         batch: Optional[Tensor] = None,
         dist_mat: Optional[Tensor] = None,
         init_scaffold: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+        robust_noise_std: float = 0.0,
+    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
         """
         Returns
         -------
-        pos_pred : (N, 3)
-        mu       : (N, latent_dim)
-        logvar   : (N, latent_dim)
+        pos_pred    : (N, 3)          posterior 潜在 z のデコード（通常 recon）
+        mu          : (N, latent_dim)
+        logvar      : (N, latent_dim)
+        pos_robust  : (N, 3) or None  off-manifold 潜在 z' のデコード（後述）
 
         eval 時は encode が決定論デコード（z = mu）を返すため、forward も
         自動的に決定論的になる（同一入力→同一 pos_pred）。train 時は確率的。
@@ -344,8 +346,24 @@ class StructuralVAE(nn.Module):
 
         init_scaffold（MDS 大域足場 (N, 3), 任意）は decoder の初期座標足場に配線。
         デフォルト None で従来どおり MLP のみの初期座標（完全後方互換）。
+
+        robust_noise_std（off-manifold ロバスト化, 任意）:
+        学習時かつ robust_noise_std>0 のとき、posterior 潜在 z に等方ガウス雑音を
+        加えた off-manifold 潜在 `z' = z + robust_noise_std * randn` を追加でデコードし
+        pos_robust として返す。呼び出し側はこの出力に GT 不要のガードレール損失
+        （clash + bond_range）だけを課し、「多少ずれた潜在でもデコーダが壊れない」
+        ことを学習させる（DiT が生成する off-manifold 潜在への頑健化）。
+        デフォルト 0.0・eval 時は pos_robust=None で完全後方互換。
         """
         z, mu, logvar = self.encode(cond, pos, edge_index, e_cond, batch, dist_mat)
         pos_pred = self.decode(z, cond, edge_index, e_cond, batch, dist_mat, init_scaffold)
-        return pos_pred, mu, logvar
+
+        # off-manifold 潜在のデコード（学習時のみ・GT 不要のガードレール損失用）
+        pos_robust: Optional[Tensor] = None
+        if self.training and robust_noise_std > 0.0:
+            z_rob = z + robust_noise_std * torch.randn_like(z)
+            pos_robust = self.decode(
+                z_rob, cond, edge_index, e_cond, batch, dist_mat, init_scaffold
+            )
+        return pos_pred, mu, logvar, pos_robust
 

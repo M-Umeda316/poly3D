@@ -30,6 +30,7 @@ from poly3d.model.cond_encoder import ConditionalEncoder
 from poly3d.model.flow_matching import FlowMatching
 from poly3d.model.features import smiles_to_data
 from poly3d.model.pos_bias import compute_graph_distance, mds_init_coords
+from poly3d.model.relax import relax_coords
 from poly3d.model.vae import StructuralVAE
 
 
@@ -45,6 +46,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--n_steps', type=int, default=100)
     p.add_argument('--device', type=str, default='auto')
     p.add_argument('--seed', type=int, default=0)
+    # ── 幾何緩和（後処理）: decode 座標に clash+bond のヒンジエネルギーを掛けて局所違反を解消 ──
+    p.add_argument('--relax', action='store_true',
+                   help='decode 後の座標に clash+bond の幾何緩和（後処理）を掛ける')
+    p.add_argument('--relax_steps', type=int, default=20, help='緩和の最適化ステップ数')
+    p.add_argument('--relax_lr', type=float, default=0.02, help='緩和 Adam の学習率')
+    p.add_argument('--relax_w_clash', type=float, default=1.0, help='clash ヒンジ項の重み')
+    p.add_argument('--relax_w_bond', type=float, default=1.0, help='bond ヒンジ項の重み')
+    p.add_argument('--relax_w_anchor', type=float, default=0.5, help='元座標アンカー項の重み')
     return p.parse_args()
 
 
@@ -87,6 +96,7 @@ def smiles_to_pyg(smiles: str, add_h: bool, use_rwpe: bool, use_lappe: bool,
         bond_type_idx=torch.from_numpy(d['bond_type_idx'].astype(np.int64)).to(device),
         bond_cont=torch.from_numpy(d['bond_cont']).to(device),
         edge_index=torch.from_numpy(d['edge_index']).to(device),
+        atomic_nums=torch.from_numpy(d['atomic_nums'].astype(np.int64)).to(device),
         batch=torch.zeros(n, dtype=torch.long, device=device),
         num_nodes=n,
     )
@@ -108,6 +118,12 @@ def generate_conformers(
     n_conf: int = 1,
     add_h: bool = True,
     n_steps: int = 100,
+    relax: bool = False,
+    relax_steps: int = 20,
+    relax_lr: float = 0.02,
+    relax_w_clash: float = 1.0,
+    relax_w_bond: float = 1.0,
+    relax_w_anchor: float = 0.5,
 ) -> list:
     """
     同一分子の n_conf 本のコンフォーマーを、ノードをブロック対角に複製した
@@ -212,6 +228,21 @@ def generate_conformers(
     # VAE Decoder → 座標（block-diagonal のまま一括デコード）
     pos = vae.decode(z0, cond_rep, edge_index_rep, e_cond_rep, batch_rep,
                      dist_mat=decode_dist_mat, init_scaffold=init_scaffold)  # (total_atoms, 3)
+
+    # ── 幾何緩和（後処理）: decode 座標に clash+bond のヒンジエネルギーを掛けて
+    #    局所違反（食い込み・結合長逸脱）を解消する。block-diagonal の
+    #    edge_index_rep / dist_mat_rep / batch_rep をそのまま流用する。
+    #    @torch.no_grad() の内側なので必ず enable_grad で包む。
+    if relax:
+        atomic_nums_rep = data.atomic_nums.repeat(n_conf)   # (total_atoms,)
+        with torch.enable_grad():
+            pos = relax_coords(
+                pos, edge_index_rep, dist_mat_rep, atomic_nums_rep,
+                batch_rep, ptr=None,
+                steps=relax_steps, lr=relax_lr,
+                w_clash=relax_w_clash, w_bond=relax_w_bond,
+                w_anchor=relax_w_anchor)
+
     pos_np = pos.cpu().numpy().astype(float)
 
     conformers = []
@@ -262,6 +293,9 @@ def main() -> None:
             mols = generate_conformers(
                 smi, cond_encoder, vae, flow, device, margs,
                 n_conf=args.n_conf, add_h=args.add_h, n_steps=args.n_steps,
+                relax=args.relax, relax_steps=args.relax_steps,
+                relax_lr=args.relax_lr, relax_w_clash=args.relax_w_clash,
+                relax_w_bond=args.relax_w_bond, relax_w_anchor=args.relax_w_anchor,
             )
             for mol in mols:
                 writer.write(mol)

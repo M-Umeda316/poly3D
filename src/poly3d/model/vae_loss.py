@@ -27,7 +27,7 @@ from poly3d.model.geo_losses import (
     angle_loss, dihedral_loss,
     build_angle_triplets, build_dihedral_quartets,
     kabsch_rmsd_loss, dist_matrix_loss, local_distance_loss,
-    longrange_distance_loss, clash_loss,
+    longrange_distance_loss, clash_loss, bond_range_loss,
 )
 
 
@@ -102,6 +102,9 @@ def vae_loss(
     clash_factor: float = 0.6,
     clash_min_graph_dist: int = 3,
     clash_max_pairs: int = 512,
+    # off-manifold ロバスト化ガードレール損失。w_robust=0 / pos_robust=None で完全無効（後方互換）
+    pos_robust: Optional[Tensor] = None,
+    w_robust: float = 0.0,
 ) -> Tuple[Tensor, dict]:
     """
     Parameters
@@ -177,9 +180,24 @@ def vae_loss(
             max_pairs=clash_max_pairs,
         )
 
+    # off-manifold ロバスト化: off-manifold 潜在 z' のデコード出力 pos_robust に
+    # GT 不要のガードレール損失（clash + bond_range）のみを課す。デコーダが「多少ずれた
+    # 潜在でも壊れない（衝突せず・結合長が破綻しない）」ことを学習させる。
+    # w_robust=0 / pos_robust=None / rvdw 無 / dist_mat 無 のいずれかで無効（後方互換）。
+    l_robust: Optional[Tensor] = None
+    if w_robust > 0.0 and pos_robust is not None and rvdw is not None and dist_mat is not None:
+        l_robust = clash_loss(
+            pos_robust, dist_mat, rvdw, batch, ptr=ptr,
+            min_graph_dist=clash_min_graph_dist,
+            clash_factor=clash_factor,
+            max_pairs=clash_max_pairs,
+        ) + bond_range_loss(pos_robust, edge_index, batch, ptr=ptr)
+
     total = w_pos * l_pos + w_bond * l_bond + w_angle * l_angle + w_dihedral * l_dihedral
     if l_clash is not None:
         total = total + w_clash * l_clash
+    if l_robust is not None:
+        total = total + w_robust * l_robust
     # beta=0 のとき 0*NaN=NaN になるのを避けるため明示的にガード
     if beta > 0.0:
         total = total + beta * l_kl
@@ -200,4 +218,6 @@ def vae_loss(
         loss_dict['pos_global'] = l_pos_global.detach()
     if l_clash is not None:
         loss_dict['clash'] = l_clash.detach()
+    if l_robust is not None:
+        loss_dict['robust'] = l_robust.detach()
     return total, loss_dict

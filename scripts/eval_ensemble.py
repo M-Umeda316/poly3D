@@ -54,6 +54,7 @@ from rdkit.Chem import TorsionFingerprints
 
 from poly3d.data.dataset import ConformerDataset, collate_fn
 from poly3d.model.geo_losses import _angle_between, _dihedral
+from poly3d.model.relax import relax_coords
 
 # evaluate_vae のモデルロードを再利用（VAE チェックポイント → cond_encoder, vae, margs）
 from evaluate_vae import _load_models
@@ -420,12 +421,20 @@ def _chunks(seq: list, size: int):
 
 @torch.no_grad()
 def generate_positions(gen_datas: list, mode: str, cond_encoder, vae, flow,
-                       device, margs, batch_size: int, n_steps: int) -> list:
+                       device, margs, batch_size: int, n_steps: int,
+                       relax: bool = False, relax_steps: int = 20,
+                       relax_lr: float = 0.02, relax_w_clash: float = 1.0,
+                       relax_w_bond: float = 1.0, relax_w_anchor: float = 0.5) -> list:
     """gen_datas（トポロジー Data のリスト）から生成配座座標を返す。
 
     recon : 各 Data 自身の実座標 pos を encode→μ→decode
     prior : z~N(0,I) を各原子潜在にサンプル→decode
     dit   : flow.sample() で z0 を得て decode（sample.py 準拠）
+
+    relax : True のとき、decode 直後の座標に clash+bond の幾何緩和（後処理）を
+            かける。各配座が自分のラベリングで edge_index / dist_mat / atomic_nums /
+            batch / ptr が揃っているこの地点で緩和する（リマップより前が正しい）。
+            dist_mat が無い（None）場合は clash 項が引けないため緩和はスキップする。
 
     戻り値: 各配座の (n, 3) fp32 cpu テンソルのリスト（gen_datas と同順）。
     collate_fn は入力 Data の topology 属性を破壊的に消費するため、gen_datas は
@@ -462,6 +471,20 @@ def generate_positions(gen_datas: list, mode: str, cond_encoder, vae, flow,
 
         pos = vae.decode(z, cond, batch.edge_index, e_cond, batch.batch,
                          dist_mat=dm, init_scaffold=scaf).float()
+
+        # ── 幾何緩和（後処理）: リマップ前・各配座が自分のラベリングでトポロジーが
+        #    揃っているこの地点で clash+bond のヒンジエネルギーを最小化する。
+        #    dist_mat（dm）が無いと clash 項が引けないためスキップ。
+        #    @torch.no_grad() の内側なので必ず enable_grad で包む。
+        if relax and dm is not None:
+            with torch.enable_grad():
+                pos = relax_coords(
+                    pos, batch.edge_index, dm, batch.atomic_nums,
+                    batch.batch, ptr=batch.ptr,
+                    steps=relax_steps, lr=relax_lr,
+                    w_clash=relax_w_clash, w_bond=relax_w_bond,
+                    w_anchor=relax_w_anchor).float()
+
         ptr = batch.ptr
         for m in range(ptr.numel() - 1):
             out.append(pos[int(ptr[m]):int(ptr[m + 1])].cpu())
@@ -575,7 +598,12 @@ def evaluate_uuid(uuid: str, indices: list, ds: ConformerDataset,
     gen_matches = [_match(d) for d in gen_datas]
 
     G_pos_raw = generate_positions(gen_datas, args.mode, cond_encoder, vae, flow,
-                                   device, margs, args.batch_size, args.n_steps)
+                                   device, margs, args.batch_size, args.n_steps,
+                                   relax=args.relax, relax_steps=args.relax_steps,
+                                   relax_lr=args.relax_lr,
+                                   relax_w_clash=args.relax_w_clash,
+                                   relax_w_bond=args.relax_w_bond,
+                                   relax_w_anchor=args.relax_w_anchor)
 
     # 生成座標を topo フレームへリマップ（マッチ不成立は除外）
     G_pos_all = []
@@ -744,6 +772,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--device', type=str, default='auto')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--out', type=str, default=None, help='結果 JSON の保存先')
+    # ── 幾何緩和（後処理）: decode 座標に clash+bond のヒンジエネルギーを掛けて局所違反を解消 ──
+    p.add_argument('--relax', action='store_true',
+                   help='decode 後の座標に clash+bond の幾何緩和（後処理）を掛ける')
+    p.add_argument('--relax_steps', type=int, default=20, help='緩和の最適化ステップ数')
+    p.add_argument('--relax_lr', type=float, default=0.02, help='緩和 Adam の学習率')
+    p.add_argument('--relax_w_clash', type=float, default=1.0, help='clash ヒンジ項の重み')
+    p.add_argument('--relax_w_bond', type=float, default=1.0, help='bond ヒンジ項の重み')
+    p.add_argument('--relax_w_anchor', type=float, default=0.5, help='元座標アンカー項の重み')
     return p.parse_args()
 
 

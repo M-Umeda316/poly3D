@@ -116,7 +116,7 @@ def test_vae():
         batch=batch,
     )
 
-    pos_pred, mu, logvar = vae(cond, pos_gt, ei, e_cond, batch)
+    pos_pred, mu, logvar, _ = vae(cond, pos_gt, ei, e_cond, batch)
     assert pos_pred.shape == (N, 3)
     assert mu.shape == (N, 8)
 

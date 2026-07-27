@@ -221,6 +221,16 @@ def parse_args() -> argparse.Namespace:
                    help='clash 対象とみなすグラフ距離の下限（eval と合わせ 3）')
     p.add_argument('--clash_max_pairs', type=int, default=512,
                    help='clash 損失で 1 分子あたりサンプリングする最大ペア数')
+    # off-manifold ロバスト化 fine-tune（方針1）。すべてデフォルト無効で完全後方互換。
+    p.add_argument('--w_robust', type=float, default=0.0,
+                   help='off-manifold 潜在デコード出力へのガードレール損失（clash+bond_range）の重み。'
+                        '0=無効（後方互換）。DiT が生成する off-manifold 潜在への頑健化用')
+    p.add_argument('--robust_noise_std', type=float, default=0.0,
+                   help='posterior 潜在 z に加える等方ガウス雑音の std（z\'=z+std*randn）。'
+                        '0=無効（後方互換）。DiT 潜在の per-atom ノルム超過分を模す')
+    p.add_argument('--freeze_encoder', action='store_true', default=False,
+                   help='cond_encoder と VAE エンコーダ部を凍結しデコーダのみ学習する。'
+                        '潜在空間を保存し既存 DiT をそのまま使って新デコーダを評価するため')
     p.add_argument('--mds_init', action='store_true', default=False,
                    help='デコーダの初期座標に MDS 大域足場（トポロジー由来）を用いる。'
                         '0=無効（後方互換、per-atom MLP のみ）')
@@ -346,13 +356,35 @@ class VAETrainer:
         self.cond_encoder = build_cond_encoder(args).to(self.device)
         self.vae = build_vae(args).to(self.device)
 
-        # DDP ラップ（分散モード時のみ）
-        if dist.is_initialized():
-            self.cond_encoder = DDP(self.cond_encoder, device_ids=[local_rank])
-            self.vae = DDP(self.vae, device_ids=[local_rank])
+        # ── エンコーダ凍結（off-manifold ロバスト化 fine-tune 用）─────────────
+        # freeze_encoder のとき cond_encoder 全体と VAE エンコーダ部（vae.encoder）を
+        # 凍結し、デコーダ（vae.decoder）のみを学習する。潜在空間が v3c のまま保たれる
+        # ため、既存 DiT（dit_v2, width256/hidden256）を再学習・潜在再計算なしにそのまま
+        # 使って新デコーダの生成妥当性を直接評価できる（＝潜在互換を設計上担保）。
+        if args.freeze_encoder:
+            self.cond_encoder.requires_grad_(False)
+            self.vae.encoder.requires_grad_(False)
+            if is_main_process():
+                print('freeze_encoder: cond_encoder と vae.encoder を凍結'
+                      '（decoder のみ学習・潜在空間 v3c を保存）')
 
-        params = (list(self.cond_encoder.parameters())
-                  + list(self.vae.parameters()))
+        # DDP ラップ（分散モード時のみ）
+        # freeze_encoder 時: 完全凍結の cond_encoder は DDP ラップしない（勾配ゼロで
+        # 通信対象が無く冗長。単一 GPU が主用途。生モジュールのままでも forward は不変）。
+        # vae は decoder が学習・encoder が凍結の混在なので、robust の二重 decode でも
+        # 落ちないよう find_unused_parameters=True でラップする。
+        if dist.is_initialized():
+            if not args.freeze_encoder:
+                self.cond_encoder = DDP(self.cond_encoder, device_ids=[local_rank])
+                self.vae = DDP(self.vae, device_ids=[local_rank])
+            else:
+                self.vae = DDP(self.vae, device_ids=[local_rank],
+                               find_unused_parameters=True)
+
+        # optimizer は学習対象（requires_grad=True）のパラメータのみを渡す。
+        # freeze_encoder 時は decoder パラメータのみが最適化される。
+        params = [p for p in (list(self.cond_encoder.parameters())
+                              + list(self.vae.parameters())) if p.requires_grad]
         # torch.compile（DDP ラップ後でも PyTorch 2.x では動作する）
         if args.compile and hasattr(torch, 'compile'):
             self.cond_encoder = torch.compile(self.cond_encoder, dynamic=True)
@@ -650,10 +682,12 @@ class VAETrainer:
                             lappe=getattr(batch, 'lappe', None),
                             batch=batch.batch,
                         )
-                        pos_pred, mu, logvar = self.vae(
+                        pos_pred, mu, logvar, pos_robust = self.vae(
                             cond, batch.pos, batch.edge_index, e_cond, batch.batch,
                             dist_mat=getattr(batch, 'dist_mat', None),
                             init_scaffold=getattr(batch, 'init_scaffold', None),
+                            # off-manifold ロバスト化は学習時のみ（val は robust 損失を課さない）
+                            robust_noise_std=(self.args.robust_noise_std if train else 0.0),
                         )
 
                         num_nodes = batch.pos.size(0)
@@ -678,11 +712,17 @@ class VAETrainer:
                             w_global=self.args.w_global,
                             # clash ガードレール損失
                             w_clash=self.args.w_clash,
+                            # rvdw は clash / robust いずれかが有効なら必要
                             rvdw=(get_rvdw_table(self.device)[batch.atomic_nums]
-                                  if self.args.w_clash > 0.0 else None),
+                                  if (self.args.w_clash > 0.0 or self.args.w_robust > 0.0)
+                                  else None),
                             clash_factor=self.args.clash_factor,
                             clash_min_graph_dist=self.args.clash_min_graph_dist,
                             clash_max_pairs=self.args.clash_max_pairs,
+                            # off-manifold ロバスト化ガードレール損失
+                            # （edge_index は上で位置引数として渡し済み。bond_range_loss で再利用）
+                            pos_robust=pos_robust,
+                            w_robust=self.args.w_robust,
                         )
 
                 if train:
@@ -1341,7 +1381,7 @@ def _benchmark_vae(trainer: VAETrainer, n_batches: int):
         # ── VAE forward ──
         with torch.autocast(device_type=device.type, dtype=trainer.amp_dtype,
                             enabled=trainer.amp_enabled):
-            pos_pred, mu, logvar = trainer.vae(
+            pos_pred, mu, logvar, _ = trainer.vae(
                 cond, batch.pos, batch.edge_index, e_cond, batch.batch
             )
         if use_cuda:

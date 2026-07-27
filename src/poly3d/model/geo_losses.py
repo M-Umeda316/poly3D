@@ -689,6 +689,7 @@ def clash_loss(
     min_graph_dist: int = 3,
     clash_factor: float = 0.6,
     max_pairs: int = 512,
+    exact: bool = False,
 ) -> Tensor:
     """
     立体衝突（steric clash）ペナルティ = eval の妥当性ゲートの clash 判定を鏡写しにした損失。
@@ -713,7 +714,10 @@ def clash_loss(
     ptr      : (B+1,) int  分子境界。None の場合は batch から復元する
     min_graph_dist : int  clash 対象とみなすグラフ距離の下限（eval と合わせ 3）
     clash_factor   : float  閾値係数（eval と合わせ 0.6）
-    max_pairs      : int  1 分子あたりの最大サンプリングペア数
+    max_pairs      : int  1 分子あたりの最大サンプリングペア数（exact=False のみ使用）
+    exact          : bool  True なら分子ごとの全ユニークペア (i<j) を厳密列挙し、サンプリングを
+                     一切行わない（見逃しゼロ）。デフォルト False は従来どおりの棄却サンプリング
+                     版で、既存の学習コードパスは一切変更しない完全後方互換。
 
     Returns
     -------
@@ -737,6 +741,54 @@ def clash_loss(
         return pos_pred.new_zeros(())
 
     starts = ptr[:-1]                          # (B,)
+
+    if exact:
+        # ── 厳密モード: 分子ごとに全ユニークペア (i<j) を列挙（サンプリングなし）──
+        # 分子ごとに `torch.triu_indices` で局所ペアを作り、分子オフセットを足して
+        # グローバルインデックスへ変換する。分子数 B 回のみ Python ループ
+        # （後処理・評価用途で低頻度呼び出しのため許容。原子数も数百程度で O(N²) は軽い）。
+        gi_list = []
+        gj_list = []
+        mol_id_list = []
+        for m in range(B):
+            n_m = int(counts[m].item())
+            if n_m < 2:
+                continue
+            local_i, local_j = torch.triu_indices(n_m, n_m, offset=1, device=device)
+            gi_list.append(starts[m] + local_i)
+            gj_list.append(starts[m] + local_j)
+            mol_id_list.append(torch.full((local_i.size(0),), m, dtype=torch.long, device=device))
+
+        if len(gi_list) == 0:
+            return pos_pred.new_zeros(())
+
+        gi_flat = torch.cat(gi_list)
+        gj_flat = torch.cat(gj_list)
+        mol_id = torch.cat(mol_id_list)
+
+        gd = dist_mat[gi_flat, gj_flat]                     # (P,) 全ペアの真のグラフ距離
+        valid = gd >= min_graph_dist                        # (P,) 真に非結合なペアのみ
+
+        device_type = device.type if device.type != 'cpu' else 'cpu'
+        with torch.autocast(device_type=device_type, enabled=False):
+            d_pred = (pos_pred.float()[gi_flat] - pos_pred.float()[gj_flat]).norm(dim=-1)   # (P,)
+            rv = rvdw.float()
+            with torch.no_grad():
+                thr = (rv[gi_flat] + rv[gj_flat]) * clash_factor                             # (P,)
+
+            overlap = (thr - d_pred).clamp(min=0.0)
+            pen = (overlap * overlap) * valid                # 無効ペアは 0
+
+            mol_count = scatter(valid.long(), mol_id, dim=0, dim_size=B, reduce='sum')       # (B,)
+            has_pair = mol_count > 0
+            if not has_pair.any():
+                return pos_pred.new_zeros(())
+
+            mol_sum = scatter(pen, mol_id, dim=0, dim_size=B, reduce='sum')                  # (B,)
+            mol_mean = mol_sum[has_pair] / mol_count[has_pair].float()
+
+        return mol_mean.mean()
+
     n_mol = counts.to(torch.float32)          # (B,)
 
     # 分子ごとに max_pairs ペアをローカル一様サンプリング（棄却サンプリング）
@@ -780,3 +832,62 @@ def clash_loss(
         mol_mean = pen.sum(dim=1)[has_pair] / mol_count[has_pair].float()
 
     return mol_mean.mean()
+
+
+def bond_range_loss(
+    pos_pred: Tensor,
+    edge_index: Tensor,
+    batch: Optional[Tensor] = None,
+    ptr: Optional[Tensor] = None,
+    bond_lo: float = 0.7,
+    bond_hi: float = 2.6,
+) -> Tensor:
+    """
+    結合長レンジ・ヒンジ損失 = eval の妥当性ゲートの結合長サニティ判定を鏡写しにした
+    **GT 不要** のガードレール損失。
+
+    妥当性ゲート（eval_ensemble.validity_of_conformer）は結合原子ペア距離が
+    [bond_lo, bond_hi] Å の範囲を外れる配座を fail とする。本損失はその範囲を
+    外れた量だけを両側ヒンジで罰し、範囲内のペアには一切勾配を与えない
+    （clash_loss と対をなす、絶対的な幾何制約のガードレール）。
+
+    clash_loss と同じく fp32 を強制する（bf16/fp16 での距離精度劣化を避ける）。
+
+    Parameters
+    ----------
+    pos_pred   : (N, 3)  予測座標（勾配はここを通る）。GT は使わない
+    edge_index : (2, E) int  結合エッジ（有向両方向でも可。対称なヒンジのため問題ない）
+    batch      : (N,) int  バッチ内の分子インデックス。指定時は「エッジごとの罰則 →
+                 エッジ端点（src）の所属分子で scatter_mean → 分子間 mean」の
+                 2 段階正規化を行う（bond_length_loss と同じ正規化方式）。
+                 None の場合は全エッジ一括 mean。
+    ptr        : 未使用（他のガードレール損失とのシグネチャ整合のために受理するのみ）
+    bond_lo    : float  結合長下限（Å）。eval と合わせ 0.7
+    bond_hi    : float  結合長上限（Å）。eval と合わせ 2.6
+
+    Returns
+    -------
+    scalar loss  (relu(bond_lo - d)^2 + relu(d - bond_hi)^2 の平均)
+                 全結合が範囲内なら 0。
+    """
+    del ptr  # シグネチャ整合のためのみ受理（現状未使用）
+
+    if edge_index.size(1) == 0:
+        return pos_pred.new_zeros(())
+
+    src, dst = edge_index
+
+    device_type = pos_pred.device.type if pos_pred.device.type != 'cpu' else 'cpu'
+    with torch.autocast(device_type=device_type, enabled=False):
+        d = (pos_pred.float()[src] - pos_pred.float()[dst]).norm(dim=-1)   # (E,)
+
+        under = (bond_lo - d).clamp(min=0.0)
+        over = (d - bond_hi).clamp(min=0.0)
+        pen = under * under + over * over            # (E,)
+
+        if batch is None:
+            return pen.mean()
+
+        mol_id = batch[src]
+        mol_mean = scatter_mean(pen, mol_id, dim=0)
+        return mol_mean.mean()
