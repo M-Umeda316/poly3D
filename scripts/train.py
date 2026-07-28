@@ -245,6 +245,14 @@ def parse_args() -> argparse.Namespace:
                    help='DiT consistency（--w_ditcons>0）で潜在生成に使う凍結 DiT '
                         'チェックポイント。DiT stage の --vae_checkpoint とは別軸で、'
                         'VAE stage のデコーダ fine-tune 中に実 DiT 潜在を供給するためのもの')
+    p.add_argument('--dit_latent_lmdb', type=str, default=None,
+                   help='precompute_dit_latents.py で事前生成した DiT 潜在 LMDB。'
+                        '指定すると DiT consistency（--w_ditcons>0）の潜在を毎バッチの '
+                        'flow.sample（ODE）で作らず、この LMDB から読むだけにする'
+                        '（大幅高速化）。指定時は VAE stage で runtime DiT を'
+                        'ロードしない（メモリ/起動時間節約）。未指定なら従来の '
+                        'runtime サンプリング経路（--vae_dit_checkpoint）が一切変わらない。'
+                        'stage=vae のみ有効・train 側にのみ配線される')
     p.add_argument('--mds_init', action='store_true', default=False,
                    help='デコーダの初期座標に MDS 大域足場（トポロジー由来）を用いる。'
                         '0=無効（後方互換、per-atom MLP のみ）')
@@ -387,8 +395,12 @@ class VAETrainer:
         # self.ditflow に保持する。学習ループでは毎バッチ no_grad で flow.sample し、
         # その off-manifold 潜在をデコードしてガードレール損失をかける。
         # 凍結・勾配不要なので DDP ラップは不要（各プロセスで独立にロードするだけ）。
+        # --dit_latent_lmdb 指定時は潜在を LMDB から読むだけなので runtime DiT は
+        # 不要（ロードをスキップしてメモリ・起動時間を節約）。w_ditcons>0 の判定は
+        # 別途 vae.forward の extra_latent 経路で維持される（batch.z_dit を渡す）。
         self.ditflow = None
-        if args.w_ditcons > 0.0 and args.vae_dit_checkpoint:
+        if (args.w_ditcons > 0.0 and args.vae_dit_checkpoint
+                and not args.dit_latent_lmdb):
             dck = torch.load(args.vae_dit_checkpoint, map_location=self.device,
                              weights_only=False)
             dargs = argparse.Namespace(**dck['args'])
@@ -400,6 +412,11 @@ class VAETrainer:
             if is_main_process():
                 print(f'DiT consistency: 凍結 DiT をロード {args.vae_dit_checkpoint} '
                       f'（w_ditcons={args.w_ditcons}, ditcons_steps={args.ditcons_steps}）')
+        elif args.w_ditcons > 0.0 and args.dit_latent_lmdb:
+            if is_main_process():
+                print(f'DiT consistency: 事前計算済み潜在 LMDB を使用 '
+                      f'{args.dit_latent_lmdb}（runtime DiT ロードなし, '
+                      f'w_ditcons={args.w_ditcons}）')
 
         # DDP ラップ（分散モード時のみ）
         # freeze_encoder 時: 完全凍結の cond_encoder は DDP ラップしない（勾配ゼロで
@@ -469,6 +486,8 @@ class VAETrainer:
             prefetch_factor=args.prefetch_factor,
             subset_indices=subset_idx,
             mds_init=args.mds_init,
+            # DiT 潜在の事前計算 LMDB は train 側にのみ配線（val は使わない）。
+            dit_latent_lmdb=args.dit_latent_lmdb,
         )
         # val も分散時は DistributedSampler で分割（全ランク重複処理の無駄を排除）。
         # shuffle=False。各ランクのバッチ数差は _all_reduce_dict の加重平均で吸収される。
@@ -715,24 +734,33 @@ class VAETrainer:
                             lappe=getattr(batch, 'lappe', None),
                             batch=batch.batch,
                         )
-                        # DiT consistency（方針1b）: 実 DiT 生成潜在を no_grad で作り
-                        # extra_latent として渡す。等方ノイズと違い原子間で相関した構造的
-                        # off-manifold 潜在なので、これに直接ガードレールを課しデコーダを鍛える。
-                        # 生成は凍結 DiT（DDP 外）で勾配不要 → no_grad + detach。
-                        # cond は上で計算済みのものを再利用（二重計算しない）。
-                        if train and self.args.w_ditcons > 0.0 and self.ditflow is not None:
-                            with torch.no_grad():
-                                z_dit = self.ditflow.sample(
-                                    n_atoms=batch.num_nodes,
-                                    cond=cond,
-                                    batch=batch.batch,
-                                    n_steps=self.args.ditcons_steps,
-                                    edge_index=batch.edge_index,
-                                    device=self.device,
-                                    dist_mat=getattr(batch, 'dist_mat', None),
-                                ).detach()
-                        else:
-                            z_dit = None
+                        # DiT consistency（方針1b）: 実 DiT 生成潜在を extra_latent として
+                        # 渡す。等方ノイズと違い原子間で相関した構造的 off-manifold 潜在なので、
+                        # これに直接ガードレールを課しデコーダを鍛える。
+                        # 高速化経路（方針1b-fast）: --dit_latent_lmdb 指定時は、この潜在を
+                        # 毎バッチの flow.sample（ODE）で作らず、事前計算済みの batch.z_dit を
+                        # そのまま使う（読むだけ）。z_dit は保存時にそのレコード自身の原子順で
+                        # 作られており pos と同順＝リマップ不要。バッチに z_dit が無い場合
+                        # （欠落・混在バッチ）は runtime サンプリング（ditflow があれば）に
+                        # フォールバックし、無ければ None。
+                        z_dit = None
+                        if train and self.args.w_ditcons > 0.0:
+                            batch_zdit = getattr(batch, 'z_dit', None)
+                            if batch_zdit is not None:
+                                # 事前計算済み潜在（勾配はデコーダのみに流す）。
+                                z_dit = batch_zdit.detach()
+                            elif self.ditflow is not None:
+                                # 従来 runtime 経路（凍結 DiT・DDP 外・勾配不要）。
+                                with torch.no_grad():
+                                    z_dit = self.ditflow.sample(
+                                        n_atoms=batch.num_nodes,
+                                        cond=cond,
+                                        batch=batch.batch,
+                                        n_steps=self.args.ditcons_steps,
+                                        edge_index=batch.edge_index,
+                                        device=self.device,
+                                        dist_mat=getattr(batch, 'dist_mat', None),
+                                    ).detach()
 
                         pos_pred, mu, logvar, pos_robust, pos_ditcons = self.vae(
                             cond, batch.pos, batch.edge_index, e_cond, batch.batch,

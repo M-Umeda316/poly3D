@@ -46,6 +46,7 @@ class ConformerDataset(Dataset):
         precompute_topology: bool = True,
         topology_cache_size: int = 4096,
         mds_init: bool = False,
+        dit_latent_lmdb: Optional[str] = None,
     ):
         self.lmdb_path = str(lmdb_path)
         self.max_atoms = max_atoms
@@ -53,6 +54,10 @@ class ConformerDataset(Dataset):
         # mds_init: True のとき __getitem__ で MDS 大域足場（init_scaffold）を付与する。
         # デフォルト False で完全後方互換（足場を一切計算せず既存挙動を不変に保つ）。
         self.mds_init = mds_init
+        # dit_latent_lmdb: 事前計算済みの DiT 潜在（precompute_dit_latents.py 生成）を
+        # 読む LMDB のパス。設定時のみ __getitem__ で同 idx の潜在を付与する。
+        # デフォルト None で完全後方互換（DiT 潜在を一切読まない）。
+        self.dit_latent_lmdb = str(dit_latent_lmdb) if dit_latent_lmdb is not None else None
         # idx → (dist_mat, triplets, quartets) のワーカーローカル LRU キャッシュ。
         # persistent_workers=True 環境ではエポックをまたいで生存するため、
         # 2 エポック目以降は同一 idx の再計算をスキップできる。
@@ -63,6 +68,8 @@ class ConformerDataset(Dataset):
         # idx → init_scaffold(n,3) のワーカーローカル LRU キャッシュ（_topo_cache と同機構）。
         self._scaffold_cache: 'OrderedDict[int, torch.Tensor]' = OrderedDict()
         self._env: Optional[lmdb.Environment] = None
+        # DiT 潜在 LMDB env（worker ごとに遅延オープン。_env と同機構）。
+        self._dit_env: Optional[lmdb.Environment] = None
 
         env = self._open_env()
         with env.begin() as txn:
@@ -80,6 +87,17 @@ class ConformerDataset(Dataset):
         if self._env is None:
             self._env = self._open_env()
         return self._env
+
+    def _open_dit_env(self) -> lmdb.Environment:
+        return lmdb.open(
+            self.dit_latent_lmdb, subdir=False, readonly=True,
+            lock=False, readahead=False, meminit=False, max_readers=256,
+        )
+
+    def _get_dit_env(self) -> lmdb.Environment:
+        if self._dit_env is None:
+            self._dit_env = self._open_dit_env()
+        return self._dit_env
 
     def __len__(self) -> int:
         return self._len
@@ -125,7 +143,38 @@ class ConformerDataset(Dataset):
             # MDS 大域足場（純トポロジー、座標非依存）。collate で pos と同様に縦連結。
             kwargs['init_scaffold'] = self._get_scaffold(idx, edge_index_t, n)
 
+        if self.dit_latent_lmdb is not None:
+            # 事前計算済み DiT 潜在（このレコード自身の原子順で保存されている）。
+            # キーが無ければ付与しない（後方互換・学習側でフォールバック）。
+            z_dit = self._get_dit_latent(idx, n)
+            if z_dit is not None:
+                kwargs['z_dit'] = z_dit
+
         return Data(**kwargs)
+
+    def _get_dit_latent(self, idx: int, n: int) -> Optional[torch.Tensor]:
+        """事前計算済み DiT 潜在 (N, latent_dim) float32 を取得する。
+
+        precompute_dit_latents.py は同じ idx キー f'{idx:09d}' で
+        (K, N, latent_dim) float32 numpy を pickle 保存している。K 個あれば
+        1 個をランダムに選ぶ（同一レコードの複数サンプルからの多様化）。
+        キーが無い（max_atoms 超過等でスキップされた）場合は None を返し、
+        学習側は z_dit 無しのバッチとして従来経路にフォールバックする。
+
+        保存時と同一 dataset・同一原子順なので、返るテンソルの行 i は
+        pos の原子 i に対応する（リマップ不要・構造的に正しい）。
+        """
+        key = f'{idx:09d}'.encode('ascii')
+        with self._get_dit_env().begin() as txn:
+            val = txn.get(key)
+        if val is None:
+            return None
+        arr = pickle.loads(val)   # (K, N, latent_dim) float32 numpy
+        if arr.ndim != 3 or arr.shape[1] != n:
+            # 想定外の形状（原子数不一致など）は安全側でスキップ＝フォールバック。
+            return None
+        k = int(torch.randint(arr.shape[0], (1,)).item()) if arr.shape[0] > 1 else 0
+        return torch.from_numpy(np.ascontiguousarray(arr[k])).float()   # (N, latent_dim)
 
     def _get_topology(
         self, idx: int, d: dict, edge_index_t: torch.Tensor, n: int
@@ -200,6 +249,9 @@ class ConformerDataset(Dataset):
         if self._env is not None:
             self._env.close()
             self._env = None
+        if self._dit_env is not None:
+            self._dit_env.close()
+            self._dit_env = None
 
 
 def collate_fn(batch: list) -> Optional[Batch]:
@@ -216,8 +268,12 @@ def collate_fn(batch: list) -> Optional[Batch]:
     all_triplets  = []
     all_quartets  = []
     all_scaffolds = []
+    all_zdit      = []
     has_topology  = hasattr(valid[0], 'dist_mat')
     has_scaffold  = hasattr(valid[0], 'init_scaffold')
+    # z_dit は「バッチ内の全レコードが持つ」ときだけ有効化する（最も単純で安全）。
+    # 一部だけ持つ混在バッチでは z_dit を作らず、学習側は従来経路にフォールバックする。
+    has_zdit      = all(hasattr(d, 'z_dit') for d in valid)
 
     sizes = [d.num_nodes for d in valid]
     total_n = sum(sizes)
@@ -242,6 +298,12 @@ def collate_fn(batch: list) -> Optional[Batch]:
             # 分子順は valid の並び＝pos の並びと一致する。
             all_scaffolds.append(d.init_scaffold)
             del d.init_scaffold
+        # z_dit は PyG の自動 collation に任せず手動処理する（混在バッチでの
+        # from_data_list 例外を避けるため、持っているものは必ず取り出して消す）。
+        if hasattr(d, 'z_dit'):
+            if has_zdit:
+                all_zdit.append(d.z_dit)
+            del d.z_dit
         offset += n
 
     pyg_batch = Batch.from_data_list(valid)
@@ -249,6 +311,13 @@ def collate_fn(batch: list) -> Optional[Batch]:
     if has_scaffold:
         # (total_N, 3) float。pos と同じ行順（分子順・原子順）で連結される。
         pyg_batch.init_scaffold = torch.cat(all_scaffolds, dim=0)
+
+    if has_zdit and all_zdit:
+        # (total_N, latent_dim) float。pos と同じ block-diagonal ノード順（分子順・
+        # 原子順）で連結される（各 z_dit の行順は保存時にそのレコードの pos と一致）。
+        pyg_batch.z_dit = torch.cat(all_zdit, dim=0)
+        assert pyg_batch.z_dit.size(0) == total_n, (
+            f'z_dit ノード数不一致: {pyg_batch.z_dit.size(0)} != {total_n}')
 
     if has_topology:
         # dist_mat: (total_N, total_N) int8 ブロック対角
@@ -278,6 +347,7 @@ def worker_init_fn(worker_id: int) -> None:
             ds = ds.dataset
         if isinstance(ds, ConformerDataset):
             ds._env = None
+            ds._dit_env = None
 
 
 def make_dataloader(
@@ -292,10 +362,11 @@ def make_dataloader(
     precompute_topology: bool = True,
     subset_indices: Optional[list] = None,
     mds_init: bool = False,
+    dit_latent_lmdb: Optional[str] = None,
 ) -> torch.utils.data.DataLoader:
     dataset = ConformerDataset(
         lmdb_path, max_atoms=max_atoms, precompute_topology=precompute_topology,
-        mds_init=mds_init,
+        mds_init=mds_init, dit_latent_lmdb=dit_latent_lmdb,
     )
     if subset_indices is not None:
         from torch.utils.data import Subset
