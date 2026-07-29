@@ -100,7 +100,7 @@ if (-not (Done "TRAIN_DONE")) {
         "--cond_layers","4","--latent_dim","16",
         "--enc_layers","4","--dec_layers","4",
         "--egt_every","2","--enc_egt_every","2",
-        "--beta_start","0.1","--beta_end","1.0","--beta_warmup_epochs","1",  # 0.1 -> 1.0 over 1 ep
+        "--beta_start","0.1","--beta_end","0.1","--beta_warmup_epochs","1",  # HOLD beta=0.1 (collapse回避, v3c-f同様)
         "--w_pos","1.0","--w_bond","1.0","--w_angle","0.5","--w_dihedral","0.1",
         "--w_clash",[string]$WClash,"--clash_factor","0.6","--clash_min_graph_dist","3","--clash_max_pairs","512",
         # SIZE OVERSAMPLING (full VAE -> encoder also learns large-unit representation)
