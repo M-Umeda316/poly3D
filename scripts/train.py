@@ -346,6 +346,21 @@ def parse_args() -> argparse.Namespace:
                         '事前に scripts/build_size_index.py で <train_lmdb>.sizes.npy を作ること。'
                         '0.0（デフォルト）で無効（従来動作を一切変えない）')
 
+    # サイズ・オーバーサンプリング（--oversample_alpha とは別軸の簡易版）。
+    # per-record サイズ .npy を明示パスで受け取り、w=max(1,size)^power の重みで
+    # WeightedRandomSampler を構築する。稀な大単位に勾配ステップを集中させる用途。
+    p.add_argument('--size_index', type=str, default=None,
+                   help='per-record サイズ配列 .npy のパス（scripts/build_size_index.py で作成）。'
+                        '長さ = train lmdb の __len__ と一致必須。--oversample_power > 0 と'
+                        '併用したときのみ WeightedRandomSampler を有効化する。'
+                        'None（デフォルト）で無効＝従来動作。VAE stage 専用・単一GPUのみ')
+    p.add_argument('--oversample_power', type=float, default=0.0,
+                   help='サイズ・オーバーサンプリングの指数。重み w_i = max(1.0, size_i)^power。'
+                        '0.0（デフォルト）で無効＝従来 shuffle（完全後方互換）。'
+                        '1=線形・2=二乗（大きいほど大単位を高頻度に抽出）。'
+                        '--size_index の指定が必須。DDP 時は分散非対応のため無効化して'
+                        'DistributedSampler にフォールバックする')
+
     return p.parse_args()
 
 
@@ -477,6 +492,12 @@ class VAETrainer:
         # DDP時 DistributedSampler）を完全に維持する。
         if args.oversample_alpha > 0:
             self._setup_oversampler(args, subset_idx)
+
+        # サイズ・オーバーサンプリング（--size_index + --oversample_power）。
+        # oversample_power=0 または size_index 未指定なら一切この経路に入らず
+        # 従来動作（train_sampler=None / DDP時 DistributedSampler）を完全維持する。
+        if args.size_index and args.oversample_power > 0:
+            self._setup_size_index_sampler(args, subset_idx)
 
         self.train_loader = make_dataloader(
             args.train_lmdb, batch_size=args.batch_size,
@@ -617,6 +638,74 @@ class VAETrainer:
                   f'プール件数={n_pool:,} / {len(weights):,}')
             print(f'  >=130 原子の割合: プール内 {frac_large_pool*100:.1f}% '
                   f'→ 抽出期待 {exp_large*100:.1f}%')
+
+    def _setup_size_index_sampler(self, args: argparse.Namespace, subset_idx: Optional[list]) -> None:
+        """
+        --size_index の per-record サイズ配列から WeightedRandomSampler を構築して
+        self.train_sampler に設定する（サイズ・オーバーサンプリング）。
+
+        重み設計:
+          - w_i = max(1.0, size_i)^power（大きいほど高頻度。size 欠損=0 でも最低 1.0）
+          - num_samples = len(dataset)（1 epoch のサンプル数は従来と同数）、復元抽出
+
+        DDP 時: WeightedRandomSampler は分散非対応（各ランクが独立にサンプリングし
+        重複・欠落が制御できない）。警告を print して重みサンプラをスキップし、
+        既に組んである DistributedSampler をそのまま使う（＝サイズ加重なしの従来動作。
+        落とさない）。単一GPU が主用途。val loader は一切変更しない。
+        """
+        import numpy as np
+        from torch.utils.data import WeightedRandomSampler
+
+        # DDP 検出時は分散非対応 → 警告して DistributedSampler にフォールバック
+        if dist.is_initialized():
+            if is_main_process():
+                print('[oversample] DDP を検出: WeightedRandomSampler は分散非対応の'
+                      'ため無効化し、DistributedSampler にフォールバックします'
+                      '（サイズ加重なしの従来動作）', flush=True)
+            return
+
+        # subset とは併用不可（サイズ配列は全 idx 前提。長さ一致の検証も崩れる）
+        if subset_idx is not None:
+            raise NotImplementedError(
+                'サイズ・オーバーサンプリング（--size_index）と --subset_ratio < 1.0 の'
+                '併用は未対応です（サイズ配列は全 idx 前提のため）'
+            )
+
+        sizes_path = Path(args.size_index)
+        if not sizes_path.exists():
+            raise FileNotFoundError(
+                f'--size_index のサイズ配列が見つかりません: {sizes_path}\n'
+                f'  先に以下を実行してください:\n'
+                f'    "{sys.executable}" scripts/build_size_index.py --src {args.train_lmdb}'
+            )
+        sz = np.load(sizes_path)
+
+        # 長さ = train lmdb の __len__（＝dataset 長）と一致必須。
+        # ConformerDataset.__len__ は max_atoms に依らず lmdb の全件数を返す。
+        from poly3d.data.dataset import ConformerDataset as _CDS
+        n_ds = len(_CDS(args.train_lmdb, max_atoms=args.max_atoms))
+        if len(sz) != n_ds:
+            raise ValueError(
+                f'--size_index の長さ {len(sz):,} が train データセット長 {n_ds:,} と'
+                f'一致しません（{sizes_path}）。\n'
+                f'  同じ lmdb から build_size_index.py で作り直してください:\n'
+                f'    "{sys.executable}" scripts/build_size_index.py --src {args.train_lmdb}'
+            )
+
+        power = float(args.oversample_power)
+        # 重み: 大きい単位ほど高頻度。max(1.0, size) で欠損(0)や極小も最低 1.0 を保証。
+        w = np.maximum(1.0, sz.astype(np.float64)) ** power
+
+        self.train_sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(w, dtype=torch.double),
+            num_samples=n_ds,
+            replacement=True,
+        )   # generator は渡さない（グローバル RNG / torch.manual_seed 済み・毎 epoch 変動）
+
+        if is_main_process():
+            print(f'[oversample] WeightedRandomSampler 有効: size_index={sizes_path} '
+                  f'power={power}  (サイズ配列長={len(sz):,}, num_samples={n_ds:,})',
+                  flush=True)
 
     def _get_beta(self, epoch: int) -> float:
         a = self.args
