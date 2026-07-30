@@ -277,6 +277,30 @@ def build(args) -> None:
                     continue
                 if props:  # 任意: CSV 由来の物性/正式SMILESを付与（ConformerDataset は無視）
                     dd['csv'] = props
+                if args.precompute_topology:
+                    # dist_mat/triplets/quartets（edge_index のみに依存する不変値）を
+                    # 事前計算して埋め込む。ConformerDataset は「保存済みなら使う・
+                    # 無ければ計算」のフォールバックなので、指定なしの既存 lmdb は
+                    # 従来どおり dataset.py 側で計算される（後方互換）。
+                    try:
+                        import torch
+                        from poly3d.model.pos_bias import compute_graph_distance
+                        from poly3d.model.geo_losses import build_angle_triplets, build_dihedral_quartets
+
+                        n = dd['atom_type_idx'].shape[0]
+                        edge_index_t = torch.from_numpy(dd['edge_index'])
+                        dist_mat = compute_graph_distance(edge_index_t, n, max_dist=4).to(torch.int8)
+                        triplets = build_angle_triplets(edge_index_t, n)
+                        quartets = build_dihedral_quartets(edge_index_t, n)
+                        dd['dist_mat'] = dist_mat.numpy()
+                        dd['triplets'] = triplets.numpy()
+                        dd['quartets'] = quartets.numpy()
+                    except Exception:
+                        # トポロジー事前計算に失敗しても単位分子自体は保存する
+                        # （dataset.py 側が起動時にフォールバック計算する）
+                        dd.pop('dist_mat', None)
+                        dd.pop('triplets', None)
+                        dd.pop('quartets', None)
                 txn.put(f'{n_ok:09d}'.encode('ascii'), pickle.dumps(dd))
                 n_ok += 1
                 if n_ok % 10_000 == 0:
@@ -310,6 +334,9 @@ def parse_args():
     p.add_argument('--max_cells_per_class', type=int, default=0, help='0=全セル')
     p.add_argument('--max_atoms', type=int, default=0, help='0=無制限（単位あたり原子数上限）')
     p.add_argument('--map_size_gb', type=int, default=50)
+    p.add_argument('--precompute_topology', action='store_true',
+                   help='dist_mat/triplets/quartets を前処理時に計算して lmdb 保存＝学習高速化'
+                        '（デフォルト無効。既存 lmdb との後方互換のため、指定しない限り付与しない）')
     return p.parse_args()
 
 
