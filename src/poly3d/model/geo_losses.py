@@ -574,7 +574,8 @@ def longrange_distance_loss(
     min_graph_dist: int = 4,
     max_pairs: int = 256,
     huber_delta: float = 1.0,
-) -> Tensor:
+    return_frac: bool = False,
+):
     """
     大域（long-range）距離損失（滑らかな大域教師信号）。
 
@@ -588,6 +589,16 @@ def longrange_distance_loss(
     各分子内でローカル原子インデックスを一様サンプルし、`dist_mat` のブロック対角
     構造から真のグラフ距離を引いて `min_graph_dist` 未満のペアを棄却する。
 
+    小分子ロバスト化: グラフ直径 < `min_graph_dist` の小単位では gd>=min_graph_dist の
+    ペアが存在せず、その分子が丸ごと大域教師から除外されてしまう（PolyOmics は小単位が
+    多い）。これを避けるため、閾値を分子ごとに
+        eff_min = min(min_graph_dist, その分子で到達可能な最大グラフ距離)
+    へ適応的にクランプする（下限 2: gd=1 は結合＝bond 損失と重複するため除外）。
+    通常分子（直径 >= min_graph_dist）は per_mol_max_gd が min_graph_dist 以上となり
+    閾値は変化しないため、従来の挙動と後方互換（数値は小分子のみ改善）。到達可能な最大
+    グラフ距離はサンプルされた非自己ペアの最大 gd で推定する（far=4 で頭打ち・分子直径の
+    確率的推定であり、サンプルが十分なら通常分子で確実に min_graph_dist に達する）。
+
     分子ごとに正規化（local_distance_loss と同じく分子単位で平均 → 分子間平均）。
     サンプリングは同一分子内のローカルインデックス（共通オフセット `ptr` 由来）で
     行うため、`dist_mat` の分子間 off-block（= far 埋め）を誤って拾うことはない。
@@ -599,13 +610,18 @@ def longrange_distance_loss(
     dist_mat : (N, N) int  ブロック対角グラフ距離行列（分子内 0-4, 4=far, clamp 済み）
     batch    : (N,) int  バッチ内の分子インデックス（連続・昇順を仮定; PyG Batch 準拠）
     ptr      : (B+1,) int  分子境界。None の場合は batch から復元する
-    min_graph_dist : int  遠隔ペアとみなすグラフ距離の下限（例 4=far）
+    min_graph_dist : int  遠隔ペアとみなすグラフ距離の下限（例 4=far）。
+                     分子ごとに到達可能な最大グラフ距離まで適応クランプされる。
     max_pairs      : int  1 分子あたりの最大サンプリングペア数
     huber_delta    : float  Huber 損失の遷移点 δ
+    return_frac    : bool  True の場合 (loss, frac) を返す。frac は「大域信号を受けた
+                     分子（有効ペアを 1 つ以上得た分子）の割合」（原子数>=2 の分子が母数）。
+                     実データでの大域項の発生頻度をログで観測するための統計。
 
     Returns
     -------
     scalar loss  (分子ごとの遠隔ペア Huber 距離損失の平均)
+                 return_frac=True の場合は (loss, frac) のタプル
 
     Notes
     -----
@@ -616,7 +632,8 @@ def longrange_distance_loss(
     """
     N = pos_pred.size(0)
     if N == 0:
-        return pos_pred.new_zeros(())
+        z = pos_pred.new_zeros(())
+        return (z, z) if return_frac else z
 
     device = pos_pred.device
 
@@ -629,7 +646,8 @@ def longrange_distance_loss(
 
     B = counts.size(0)
     if B == 0:
-        return pos_pred.new_zeros(())
+        z = pos_pred.new_zeros(())
+        return (z, z) if return_frac else z
 
     starts = ptr[:-1]                          # (B,) 各分子の先頭ノード
     n_mol = counts.to(torch.float32)          # (B,) 各分子の原子数
@@ -654,8 +672,20 @@ def longrange_distance_loss(
     # 真のグラフ距離をブロック対角行列から取得（同一分子内なので off-block を拾わない）
     gd = dist_mat[gi.reshape(-1), gj.reshape(-1)].view(B, max_pairs)
 
-    # 有効ペア: グラフ距離 >= 閾値 かつ 自己ペアでない かつ 原子数 >= 2
-    valid = (gd >= min_graph_dist) & (ia != ib) & (counts.unsqueeze(1) >= 2)
+    # ── 小分子ロバスト化: 閾値を分子ごとに適応クランプ ──────────────────────────
+    # サンプルされた非自己ペアの最大グラフ距離で分子直径を推定（far=4 で頭打ち）。
+    # eff_min = min(min_graph_dist, per_mol_max_gd)。下限 2（gd=1 は結合＝bond 損失
+    # と重複するため除外）。通常分子（直径 >= min_graph_dist）は per_mol_max_gd が
+    # min_graph_dist 以上となり eff_min == min_graph_dist で従来と一致（後方互換）。
+    self_mask = ia != ib
+    gd_nonself = torch.where(self_mask, gd, torch.zeros_like(gd))
+    per_mol_max_gd = gd_nonself.amax(dim=1)                        # (B,)
+    eff_min = torch.minimum(
+        torch.full_like(per_mol_max_gd, min_graph_dist), per_mol_max_gd
+    ).clamp(min=2)                                                 # (B,)
+
+    # 有効ペア: グラフ距離 >= 適応閾値 かつ 自己ペアでない かつ 原子数 >= 2
+    valid = (gd >= eff_min.unsqueeze(1)) & self_mask & (counts.unsqueeze(1) >= 2)
 
     # ── 距離差の Huber（fp32 強制。cdist 同様 bf16/fp16 の精度劣化を避ける）──
     device_type = device.type if device.type != 'cpu' else 'cpu'
@@ -671,10 +701,120 @@ def longrange_distance_loss(
 
         mol_count = valid.sum(dim=1)                                              # (B,)
         has_pair = mol_count > 0
+        # 大域信号を受けた分子の割合（原子数>=2 の分子が母数）。小分子ロバスト化の
+        # 効果・実データでの発生頻度を後で観測できるよう常に算出する。
+        eligible = counts >= 2
+        frac = has_pair.sum().float() / eligible.sum().clamp(min=1).float()
+
         if not has_pair.any():
-            return pos_pred.new_zeros(())
+            z = pos_pred.new_zeros(())
+            return (z, frac) if return_frac else z
 
         mol_sum = huber.sum(dim=1)
+        mol_mean = mol_sum[has_pair] / mol_count[has_pair].float()
+
+    loss = mol_mean.mean()
+    return (loss, frac) if return_frac else loss
+
+
+def enumerate_clash_pairs(
+    dist_mat: Tensor,
+    batch: Tensor,
+    ptr: Optional[Tensor] = None,
+    min_graph_dist: int = 3,
+):
+    """
+    clash 判定対象の全ユニークペア (i<j) をトポロジ不変に厳密列挙する（座標非依存）。
+
+    `clash_loss(exact=True)` の「列挙」部分を切り出したもの。トポロジ（結合・グラフ距離）
+    が不変な限りペア集合・有効フラグも不変のため、relax の Adam ループのように同一分子へ
+    複数回エネルギー評価する用途では 1 度だけ呼んで使い回せる（毎ステップの triu 再列挙と
+    分子数 B 回の Python ループを除去できる）。
+
+    Returns
+    -------
+    (gi, gj, mol_id, valid, B)
+      gi, gj  : (P,) int64  グローバル原子インデックス（i<j, ブロック内）
+      mol_id  : (P,) int64  各ペアの所属分子インデックス
+      valid   : (P,) bool   グラフ距離 >= min_graph_dist（真に非結合）なペア
+      B       : int         分子数
+    """
+    device = dist_mat.device
+    if ptr is None:
+        counts = torch.bincount(batch)
+        ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+    else:
+        counts = ptr[1:] - ptr[:-1]
+
+    B = counts.size(0)
+    starts = ptr[:-1]
+
+    gi_list = []
+    gj_list = []
+    mol_id_list = []
+    for m in range(B):
+        n_m = int(counts[m].item())
+        if n_m < 2:
+            continue
+        local_i, local_j = torch.triu_indices(n_m, n_m, offset=1, device=device)
+        gi_list.append(starts[m] + local_i)
+        gj_list.append(starts[m] + local_j)
+        mol_id_list.append(torch.full((local_i.size(0),), m, dtype=torch.long, device=device))
+
+    if len(gi_list) == 0:
+        empty_l = torch.zeros(0, dtype=torch.long, device=device)
+        empty_b = torch.zeros(0, dtype=torch.bool, device=device)
+        return empty_l, empty_l, empty_l, empty_b, B
+
+    gi = torch.cat(gi_list)
+    gj = torch.cat(gj_list)
+    mol_id = torch.cat(mol_id_list)
+
+    gd = dist_mat[gi, gj]                      # (P,) 真のグラフ距離
+    valid = gd >= min_graph_dist               # (P,) 真に非結合なペアのみ
+    return gi, gj, mol_id, valid, B
+
+
+def clash_energy_from_pairs(
+    pos: Tensor,
+    gi: Tensor,
+    gj: Tensor,
+    mol_id: Tensor,
+    valid: Tensor,
+    rvdw: Tensor,
+    clash_factor: float,
+    B: int,
+) -> Tensor:
+    """
+    事前列挙済みペア（`enumerate_clash_pairs`）から clash エネルギーを計算する。
+
+    `clash_loss(exact=True)` の「エネルギー計算」部分を切り出したもの。列挙結果を
+    使い回すことで、座標のみが変化する反復最適化（relax）で列挙コストを省ける。
+    エネルギー・正規化は `clash_loss(exact=True)` と数値的に完全一致する。
+
+    Returns
+    -------
+    scalar loss  (分子ごとの平均 clash エネルギー relu(thr - d)^2 の分子間平均)
+    """
+    if gi.numel() == 0:
+        return pos.new_zeros(())
+
+    device_type = pos.device.type if pos.device.type != 'cpu' else 'cpu'
+    with torch.autocast(device_type=device_type, enabled=False):
+        d_pred = (pos.float()[gi] - pos.float()[gj]).norm(dim=-1)   # (P,)
+        rv = rvdw.float()
+        with torch.no_grad():
+            thr = (rv[gi] + rv[gj]) * clash_factor                   # (P,)
+
+        overlap = (thr - d_pred).clamp(min=0.0)
+        pen = (overlap * overlap) * valid                # 無効ペアは 0
+
+        mol_count = scatter(valid.long(), mol_id, dim=0, dim_size=B, reduce='sum')       # (B,)
+        has_pair = mol_count > 0
+        if not has_pair.any():
+            return pos.new_zeros(())
+
+        mol_sum = scatter(pen, mol_id, dim=0, dim_size=B, reduce='sum')                  # (B,)
         mol_mean = mol_sum[has_pair] / mol_count[has_pair].float()
 
     return mol_mean.mean()
@@ -743,51 +883,16 @@ def clash_loss(
     starts = ptr[:-1]                          # (B,)
 
     if exact:
-        # ── 厳密モード: 分子ごとに全ユニークペア (i<j) を列挙（サンプリングなし）──
-        # 分子ごとに `torch.triu_indices` で局所ペアを作り、分子オフセットを足して
-        # グローバルインデックスへ変換する。分子数 B 回のみ Python ループ
-        # （後処理・評価用途で低頻度呼び出しのため許容。原子数も数百程度で O(N²) は軽い）。
-        gi_list = []
-        gj_list = []
-        mol_id_list = []
-        for m in range(B):
-            n_m = int(counts[m].item())
-            if n_m < 2:
-                continue
-            local_i, local_j = torch.triu_indices(n_m, n_m, offset=1, device=device)
-            gi_list.append(starts[m] + local_i)
-            gj_list.append(starts[m] + local_j)
-            mol_id_list.append(torch.full((local_i.size(0),), m, dtype=torch.long, device=device))
-
-        if len(gi_list) == 0:
-            return pos_pred.new_zeros(())
-
-        gi_flat = torch.cat(gi_list)
-        gj_flat = torch.cat(gj_list)
-        mol_id = torch.cat(mol_id_list)
-
-        gd = dist_mat[gi_flat, gj_flat]                     # (P,) 全ペアの真のグラフ距離
-        valid = gd >= min_graph_dist                        # (P,) 真に非結合なペアのみ
-
-        device_type = device.type if device.type != 'cpu' else 'cpu'
-        with torch.autocast(device_type=device_type, enabled=False):
-            d_pred = (pos_pred.float()[gi_flat] - pos_pred.float()[gj_flat]).norm(dim=-1)   # (P,)
-            rv = rvdw.float()
-            with torch.no_grad():
-                thr = (rv[gi_flat] + rv[gj_flat]) * clash_factor                             # (P,)
-
-            overlap = (thr - d_pred).clamp(min=0.0)
-            pen = (overlap * overlap) * valid                # 無効ペアは 0
-
-            mol_count = scatter(valid.long(), mol_id, dim=0, dim_size=B, reduce='sum')       # (B,)
-            has_pair = mol_count > 0
-            if not has_pair.any():
-                return pos_pred.new_zeros(())
-
-            mol_sum = scatter(pen, mol_id, dim=0, dim_size=B, reduce='sum')                  # (B,)
-            mol_mean = mol_sum[has_pair] / mol_count[has_pair].float()
-
-        return mol_mean.mean()
+        # ── 厳密モード: 全ユニークペア (i<j) を厳密列挙してエネルギー計算（サンプリングなし）──
+        # 「列挙」と「エネルギー計算」を enumerate_clash_pairs / clash_energy_from_pairs に
+        # 分離した。列挙はトポロジ不変なので relax 等では 1 度だけ呼んで使い回せる
+        # （本関数経由では従来どおり毎回列挙するが、数値は分離前と完全一致）。
+        gi, gj, mol_id, valid, B = enumerate_clash_pairs(
+            dist_mat, batch, ptr=ptr, min_graph_dist=min_graph_dist
+        )
+        return clash_energy_from_pairs(
+            pos_pred, gi, gj, mol_id, valid, rvdw, clash_factor, B
+        )
 
     n_mol = counts.to(torch.float32)          # (B,)
 
@@ -891,3 +996,63 @@ def bond_range_loss(
         mol_id = batch[src]
         mol_mean = scatter_mean(pen, mol_id, dim=0)
         return mol_mean.mean()
+
+
+def guardrail_energy(
+    pos: Tensor,
+    dist_mat: Optional[Tensor],
+    rvdw: Tensor,
+    batch: Tensor,
+    ptr: Optional[Tensor],
+    edge_index: Tensor,
+    clash_factor: float = 0.6,
+    clash_min_graph_dist: int = 3,
+    clash_max_pairs: int = 512,
+    bond_lo: float = 0.7,
+    bond_hi: float = 2.6,
+    exact: bool = False,
+    w_clash: float = 1.0,
+    w_bond: float = 1.0,
+    clash_pairs=None,
+) -> Tensor:
+    """
+    GT 不要のガードレールエネルギー = clash（立体衝突）+ bond_range（結合長レンジ）の合成。
+
+    vae_loss の l_robust / l_ditcons と relax の目的関数が同一の
+    `clash_loss(...) + bond_range_loss(...)` を各所で重複記述していたのを 1 箇所に
+    集約したヘルパ。単体の clash_loss / bond_range_loss を単純合成するだけなので、
+    デフォルト重み（w_clash=w_bond=1.0）では従来の各記述と数値的に完全一致する。
+
+    Parameters
+    ----------
+    pos        : (N, 3)  座標（勾配はここを通る）。GT は使わない
+    dist_mat   : (N, N) int  ブロック対角グラフ距離行列（clash 用）。clash_pairs 指定時は未使用
+    rvdw       : (N,) float  原子ごとの van der Waals 半径（clash 用）
+    batch      : (N,) int  分子インデックス
+    ptr        : (B+1,) int  分子境界（None 可）
+    edge_index : (2, E) int  結合エッジ（bond_range 用）
+    clash_factor / clash_min_graph_dist / clash_max_pairs : clash_loss へそのまま渡す
+    bond_lo / bond_hi : bond_range_loss へそのまま渡す
+    exact      : bool  clash を厳密列挙で評価するか（サンプリング=False）。
+                 clash_pairs 指定時は無視される
+    w_clash / w_bond : float  各項の重み（relax の per-term 重みに対応。デフォルト 1.0）
+    clash_pairs : Optional  `enumerate_clash_pairs` の戻り値 (gi, gj, mol_id, valid, B)。
+                 指定するとトポロジ不変な列挙を使い回して clash を評価する（relax の反復
+                 最適化で毎ステップの再列挙を避けるため）。exact/dist_mat/clash_max_pairs
+                 より優先される。
+
+    Returns
+    -------
+    scalar loss  (w_clash * clash + w_bond * bond_range)
+    """
+    if clash_pairs is not None:
+        gi, gj, mol_id, valid, B = clash_pairs
+        l_clash = clash_energy_from_pairs(pos, gi, gj, mol_id, valid, rvdw, clash_factor, B)
+    else:
+        l_clash = clash_loss(
+            pos, dist_mat, rvdw, batch, ptr=ptr,
+            min_graph_dist=clash_min_graph_dist, clash_factor=clash_factor,
+            max_pairs=clash_max_pairs, exact=exact,
+        )
+    l_bond = bond_range_loss(pos, edge_index, batch, ptr=ptr, bond_lo=bond_lo, bond_hi=bond_hi)
+    return w_clash * l_clash + w_bond * l_bond

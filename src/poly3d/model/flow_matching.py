@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch_scatter import scatter_mean
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
@@ -104,10 +105,19 @@ class FlowMatching(nn.Module):
         # 本番パス: self.model 経由で呼ぶことで DDP gradient sync が正しく発動
         z1_pred = self.model(zt, cond, t, batch, z_sc=z_sc, attn_bias=attn_bias)
 
-        # 損失: 1/(1-t)^2 * ||Z1 - Z1_pred||^2 の平均
-        # ||.||^2 は L2 ノルムの二乗（sum）であり mean ではない
-        weight = 1.0 / (1.0 - t_node).pow(2).clamp(min=1e-4)
-        flow_loss = (weight * (z1 - z1_pred).pow(2).sum(dim=-1)).mean()
+        # 損失: 1/(1-t)^2 * ||Z1 - Z1_pred||^2
+        # ||.||^2 は L2 ノルムの二乗（latent 次元方向 sum）であり mean ではない。
+        # weight = 1/(1-t)^2 は per-node（t は分子ごとだが t_node = t[batch] で各ノードへ展開）。
+        #
+        # 正規化はコードベース他損失（bond/angle/dihedral/kabsch）と統一し、
+        # 「per-node 損失 → 分子ごと scatter_mean → 分子間 mean」の 2 段階に変更する。
+        # 従来の全ノードフラット mean は大分子（原子数が多い分子）が支配していたが、
+        # 分子ごとに正規化することでサイズ不揃いのバッチ（PIMD 67 重原子等）でも
+        # 各分子が等しく寄与し、大分子加重が除去される。
+        weight = 1.0 / (1.0 - t_node).pow(2).clamp(min=1e-4)          # (N,)
+        per_node = weight * (z1 - z1_pred).pow(2).sum(dim=-1)          # (N,)
+        mol_loss = scatter_mean(per_node, batch, dim=0, dim_size=B)    # (B,)
+        flow_loss = mol_loss.mean()
 
         return flow_loss, {'flow': flow_loss.detach()}
 

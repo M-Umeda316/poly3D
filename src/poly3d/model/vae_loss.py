@@ -27,7 +27,8 @@ from poly3d.model.geo_losses import (
     angle_loss, dihedral_loss,
     build_angle_triplets, build_dihedral_quartets,
     kabsch_rmsd_loss, dist_matrix_loss, local_distance_loss,
-    longrange_distance_loss, clash_loss, bond_range_loss,
+    longrange_distance_loss, clash_loss,
+    guardrail_energy,
 )
 
 
@@ -134,6 +135,7 @@ def vae_loss(
     # multiscale の内訳ログ用（該当時のみ埋める）
     l_pos_local: Optional[Tensor] = None
     l_pos_global: Optional[Tensor] = None
+    pos_global_frac: Optional[Tensor] = None    # 大域信号を受けた分子の割合（ログ用）
     if pos_loss_type == 'distmat':
         l_pos = dist_matrix_loss(pos_pred, pos_gt, batch)
     elif pos_loss_type == 'local_distmat':
@@ -142,11 +144,12 @@ def vae_loss(
         # 局所（近接ペア距離）＋ 大域（遠隔ペア距離 Huber, サンプリング版）
         l_pos_local = local_distance_loss(pos_pred, pos_gt, batch, cutoff=local_cutoff)
         if dist_mat is not None:
-            l_pos_global = longrange_distance_loss(
+            l_pos_global, pos_global_frac = longrange_distance_loss(
                 pos_pred, pos_gt, dist_mat, batch, ptr=ptr,
                 min_graph_dist=longrange_min_graph_dist,
                 max_pairs=longrange_max_pairs,
                 huber_delta=longrange_huber_delta,
+                return_frac=True,
             )
         else:
             # dist_mat 未供給時は大域項をスキップ（局所のみで後方互換的に動作）
@@ -189,12 +192,13 @@ def vae_loss(
     # w_robust=0 / pos_robust=None / rvdw 無 / dist_mat 無 のいずれかで無効（後方互換）。
     l_robust: Optional[Tensor] = None
     if w_robust > 0.0 and pos_robust is not None and rvdw is not None and dist_mat is not None:
-        l_robust = clash_loss(
-            pos_robust, dist_mat, rvdw, batch, ptr=ptr,
-            min_graph_dist=clash_min_graph_dist,
+        l_robust = guardrail_energy(
+            pos_robust, dist_mat, rvdw, batch, ptr, edge_index,
             clash_factor=clash_factor,
-            max_pairs=clash_max_pairs,
-        ) + bond_range_loss(pos_robust, edge_index, batch, ptr=ptr)
+            clash_min_graph_dist=clash_min_graph_dist,
+            clash_max_pairs=clash_max_pairs,
+            exact=False,
+        )
 
     # DiT consistency: 実 DiT 生成潜在のデコード出力 pos_ditcons に GT 不要のガードレール損失
     # （clash + bond_range）のみを課す。等方ノイズ（robust）では覆えない、原子間で相関した
@@ -203,12 +207,13 @@ def vae_loss(
     # w_ditcons=0 / pos_ditcons=None / rvdw 無 / dist_mat 無 のいずれかで無効（後方互換）。
     l_ditcons: Optional[Tensor] = None
     if w_ditcons > 0.0 and pos_ditcons is not None and rvdw is not None and dist_mat is not None:
-        l_ditcons = clash_loss(
-            pos_ditcons, dist_mat, rvdw, batch, ptr=ptr,
-            min_graph_dist=clash_min_graph_dist,
+        l_ditcons = guardrail_energy(
+            pos_ditcons, dist_mat, rvdw, batch, ptr, edge_index,
             clash_factor=clash_factor,
-            max_pairs=clash_max_pairs,
-        ) + bond_range_loss(pos_ditcons, edge_index, batch, ptr=ptr)
+            clash_min_graph_dist=clash_min_graph_dist,
+            clash_max_pairs=clash_max_pairs,
+            exact=False,
+        )
 
     total = w_pos * l_pos + w_bond * l_bond + w_angle * l_angle + w_dihedral * l_dihedral
     if l_clash is not None:
@@ -235,6 +240,9 @@ def vae_loss(
     if l_pos_local is not None:
         loss_dict['pos_local'] = l_pos_local.detach()
         loss_dict['pos_global'] = l_pos_global.detach()
+        # 大域信号を受けた分子の割合（小分子ロバスト化の効果・発生頻度の観測用）
+        if pos_global_frac is not None:
+            loss_dict['pos_global_frac'] = pos_global_frac.detach()
     if l_clash is not None:
         loss_dict['clash'] = l_clash.detach()
     if l_robust is not None:

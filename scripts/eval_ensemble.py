@@ -702,25 +702,44 @@ def _agg(values: list) -> dict:
 
 
 def aggregate(per_uuid: list) -> dict:
-    """uuid 代表値のリストを全体 / サイズ帯別に集約する。"""
-    overall = {k: _agg([r[k] for r in per_uuid]) for k in _METRIC_KEYS}
+    """uuid 代表値のリストを全体 / サイズ帯別に集約する。
+
+    sanitize_ok=False（uuid 内の全配座で RDKit sanitize が失敗し、topo 基準の
+    quartets/triplets/bonds へのリマップが一切行えなかった uuid）は集計対象から
+    除外する。この場合 validity_of_conformer が sanitize_ok を AND 条件に含む
+    ため生成配座は必ず invalid 判定となり、torsion/bond/angle/COV-MAT 等は
+    （早期 return により）NaN のまま _agg でフィルタされ混入しないが、
+    validity_pass_rate=0.0 だけは生成品質と無関係な「そもそも評価不能」の
+    結果として分布に混入してしまう。これを避けるため sanitize 失敗 uuid は
+    ここで明示的に弾く（sanitize 成功 uuid の集計値は従来と不変）。
+    """
+    n_total = len(per_uuid)
+    filtered = [r for r in per_uuid if r.get('sanitize_ok', True)]
+    n_excluded = n_total - len(filtered)
+
+    overall = {k: _agg([r[k] for r in filtered]) for k in _METRIC_KEYS}
 
     by_size = {}
     for i in range(len(_SIZE_BINS) - 1):
         lo, hi = _SIZE_BINS[i], _SIZE_BINS[i + 1]
-        sub = [r for r in per_uuid if lo <= r['n_heavy'] < hi]
+        sub = [r for r in filtered if lo <= r['n_heavy'] < hi]
         if not sub:
             continue
         label = f'[{lo},{hi if hi < 10_000 else "+"})'
         by_size[label] = {'n_uuid': len(sub),
                           **{k: _agg([r[k] for r in sub]) for k in _METRIC_KEYS}}
-    return {'overall': overall, 'by_size': by_size}
+    return {'overall': overall, 'by_size': by_size,
+            'n_uuid_total': n_total, 'n_uuid_excluded_sanitize_fail': n_excluded}
 
 
 def _print_report(result: dict):
     agg = result['aggregate']
     print(f'\n{"=" * 74}')
     print(f'  アンサンブル分布評価  |  mode={result["mode"]}  |  {result["n_uuid"]} uuid')
+    n_excl = agg.get('n_uuid_excluded_sanitize_fail', 0)
+    if n_excl > 0:
+        print(f'  ※ sanitize 全失敗で集計除外: {n_excl} uuid'
+              f' （集計対象 = {agg.get("n_uuid_total", result["n_uuid"]) - n_excl} uuid）')
     print(f'{"=" * 74}')
     print(f'  {"指標":<22} {"median":>10} {"mean":>10} {"p90":>10} {"n":>5}')
     print(f'  {"-" * 66}')

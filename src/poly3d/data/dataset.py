@@ -77,6 +77,61 @@ class ConformerDataset(Dataset):
             self._len = int(meta.decode('ascii')) if meta else txn.stat()['entries']
         env.close()
 
+        # dit_latent_lmdb 指定時のみ整合性を検証する（未指定なら従来通り何もしない）。
+        # __len__ が一致するだけでは別ビルド/別split の取り違えを検出できない
+        # （_get_dit_latent は原子数一致のみ見ているため、たまたま原子数が同じ
+        # 別分子の潜在を誤って対応付ける恐れがある）。
+        if self.dit_latent_lmdb is not None:
+            self._validate_dit_latent_lmdb()
+
+    def _validate_dit_latent_lmdb(self) -> None:
+        """--dit_latent_lmdb と train lmdb の整合性を検証する（未指定時は呼ばれない）。
+
+        1. __len__ の一致を assert（不一致なら別ビルド/別split の可能性が高い）。
+        2. 軽量チェックとして先頭数レコードの原子数を突き合わせる（全件走査は
+           コストが高いため件数を絞る）。不一致が見つかれば明確な例外で停止する。
+
+        いずれのチェックも「原子数がたまたま一致した別分子の潜在を誤って pos に
+        対応付ける」事故を早期に検出するためのものであり、正しい lmdb が指定
+        されている限り副作用は無い。
+        """
+        dit_env = self._open_dit_env()
+        train_env = self._open_env()
+        try:
+            with dit_env.begin() as txn:
+                meta = txn.get(b'__len__')
+                dit_len = int(meta.decode('ascii')) if meta else txn.stat()['entries']
+            if dit_len != self._len:
+                raise ValueError(
+                    f'--dit_latent_lmdb の長さ ({dit_len:,}) が train lmdb の長さ '
+                    f'({self._len:,}) と一致しません。\n'
+                    f'  train_lmdb      : {self.lmdb_path}\n'
+                    f'  dit_latent_lmdb : {self.dit_latent_lmdb}\n'
+                    f'  別ビルド/別split の LMDB を指定していないか確認してください。'
+                )
+
+            n_check = min(5, self._len)
+            with train_env.begin() as ttxn, dit_env.begin() as dtxn:
+                for idx in range(n_check):
+                    key = f'{idx:09d}'.encode('ascii')
+                    tval = ttxn.get(key)
+                    dval = dtxn.get(key)
+                    if tval is None or dval is None:
+                        continue
+                    n_train = pickle.loads(tval)['atom_type_idx'].shape[0]
+                    arr = pickle.loads(dval)
+                    if arr.ndim == 3 and arr.shape[1] != n_train:
+                        raise ValueError(
+                            f'--dit_latent_lmdb の idx={idx} の原子数 ({arr.shape[1]}) が '
+                            f'train lmdb の原子数 ({n_train}) と一致しません。\n'
+                            f'  train_lmdb      : {self.lmdb_path}\n'
+                            f'  dit_latent_lmdb : {self.dit_latent_lmdb}\n'
+                            f'  別ビルド/別split の LMDB を指定していないか確認してください。'
+                        )
+        finally:
+            dit_env.close()
+            train_env.close()
+
     def _open_env(self) -> lmdb.Environment:
         return lmdb.open(
             self.lmdb_path, subdir=False, readonly=True,

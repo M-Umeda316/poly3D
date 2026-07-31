@@ -20,7 +20,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch_scatter import scatter_mean
 
-from poly3d.model.egnn import EGNN, EGNNLayer, EGTLayer
+from poly3d.model.egnn import EGNNLayer, EGTLayer, build_egt_context
 
 
 class VAEEncoder(nn.Module):
@@ -85,6 +85,7 @@ class VAEEncoder(nn.Module):
         e_cond: Tensor,      # (E, edge_dim)
         batch: Optional[Tensor] = None,
         dist_mat: Optional[Tensor] = None,  # (total_N, total_N) グラフ距離（任意）
+        attn_ctx: Optional[dict] = None,    # build_egt_context の戻り値（事前計算コンテキスト）
     ) -> Tuple[Tensor, Tensor]:
         """
         Returns
@@ -95,12 +96,17 @@ class VAEEncoder(nn.Module):
         エンコーダは実座標 pos を入力座標に取り、EGNN/EGT で h を更新する。
         座標 x の更新は使わず（潜在は h のみから作る）h の最終値を μ/logσ に写す。
         dist_mat は EGTLayer の b_graph に供給（None なら 3D 距離バイアスのみ）。
+
+        attn_ctx が未提供かつ EGT 層を含む場合は forward 先頭で 1 回だけ計算し、
+        全 EGT 層で共有する（毎レイヤーの gather_idx/graph_onehot 再計算を撤廃）。
         """
         h = self.input_norm(self.input_proj(cond))   # (N, hidden_dim)
         x = pos
+        if attn_ctx is None and any(self.layer_is_egt):
+            attn_ctx = build_egt_context(batch, cond.size(0), cond.device, dist_mat)
         for layer, is_egt in zip(self.layers, self.layer_is_egt):
             if is_egt:
-                h, x = layer(h, x, edge_index, e_cond, batch, dist_mat)
+                h, x = layer(h, x, edge_index, e_cond, batch, dist_mat, attn_ctx)
             else:
                 h, x = layer(h, x, edge_index, e_cond, batch)
         mu = self.mu_head(h)
@@ -185,6 +191,7 @@ class VAEDecoder(nn.Module):
         batch: Optional[Tensor] = None,
         dist_mat: Optional[Tensor] = None,  # (total_N, total_N) グラフ距離（任意）
         init_scaffold: Optional[Tensor] = None,  # (N, 3) MDS 大域足場（任意）
+        attn_ctx: Optional[dict] = None,    # build_egt_context の戻り値（事前計算コンテキスト）
     ) -> Tensor:
         """
         Returns
@@ -216,9 +223,13 @@ class VAEDecoder(nn.Module):
         h = self.input_norm(self.input_proj(feat))   # (N, hidden_dim)
         x = x0
 
+        # EGT 層を含む場合は z 非依存コンテキストを 1 回だけ計算して全 EGT 層で共有。
+        # StructuralVAE から attn_ctx が渡された場合は encode/複数 decode 間でも使い回す。
+        if attn_ctx is None and any(self.layer_is_egt):
+            attn_ctx = build_egt_context(batch, z.size(0), z.device, dist_mat)
         for layer, is_egt in zip(self.layers, self.layer_is_egt):
             if is_egt:
-                h, x = layer(h, x, edge_index, e_cond, batch, dist_mat)
+                h, x = layer(h, x, edge_index, e_cond, batch, dist_mat, attn_ctx)
             else:
                 h, x = layer(h, x, edge_index, e_cond, batch)
 
@@ -288,6 +299,7 @@ class StructuralVAE(nn.Module):
         e_cond: Tensor,
         batch: Optional[Tensor] = None,
         dist_mat: Optional[Tensor] = None,
+        attn_ctx: Optional[dict] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Returns
@@ -296,7 +308,7 @@ class StructuralVAE(nn.Module):
         mu     : (N, latent_dim)
         logvar : (N, latent_dim)
         """
-        mu, logvar = self.encoder(cond, pos, edge_index, e_cond, batch, dist_mat)
+        mu, logvar = self.encoder(cond, pos, edge_index, e_cond, batch, dist_mat, attn_ctx)
         # 評価（eval）時は決定論デコード（z = mu）で乱数ノイズを排除し、
         # val loss のばらつき＝チェックポイント選択ノイズを防ぐ。
         # 学習（train）時は従来どおり reparameterize で確率的サンプリング。
@@ -316,8 +328,11 @@ class StructuralVAE(nn.Module):
         batch: Optional[Tensor] = None,
         dist_mat: Optional[Tensor] = None,
         init_scaffold: Optional[Tensor] = None,
+        attn_ctx: Optional[dict] = None,
     ) -> Tensor:
-        return self.decoder(z, cond, edge_index, e_cond, batch, dist_mat, init_scaffold)
+        return self.decoder(
+            z, cond, edge_index, e_cond, batch, dist_mat, init_scaffold, attn_ctx,
+        )
 
     def forward(
         self,
@@ -366,22 +381,32 @@ class StructuralVAE(nn.Module):
         no_grad 生成・detach 済みの潜在を渡す想定（勾配はデコーダのみに流れる）。
         デフォルト None・eval 時は pos_ditcons=None で完全後方互換。
         """
-        z, mu, logvar = self.encode(cond, pos, edge_index, e_cond, batch, dist_mat)
-        pos_pred = self.decode(z, cond, edge_index, e_cond, batch, dist_mat, init_scaffold)
+        # EGT の z 非依存コンテキスト（gather_idx/pad_mask/graph_onehot）は
+        # batch・dist_mat・num_nodes のみに依存し encode/複数 decode で共通のため、
+        # ここで 1 回だけ計算して使い回す（1 step で最大 8 回の同一再計算を撤廃）。
+        # enc_egt_every / egt_every のいずれかが有効なときのみ構築する。
+        attn_ctx: Optional[dict] = None
+        if self.enc_egt_every > 0 or self.egt_every > 0:
+            attn_ctx = build_egt_context(batch, cond.size(0), cond.device, dist_mat)
+
+        z, mu, logvar = self.encode(cond, pos, edge_index, e_cond, batch, dist_mat, attn_ctx)
+        pos_pred = self.decode(
+            z, cond, edge_index, e_cond, batch, dist_mat, init_scaffold, attn_ctx
+        )
 
         # off-manifold 潜在のデコード（学習時のみ・GT 不要のガードレール損失用）
         pos_robust: Optional[Tensor] = None
         if self.training and robust_noise_std > 0.0:
             z_rob = z + robust_noise_std * torch.randn_like(z)
             pos_robust = self.decode(
-                z_rob, cond, edge_index, e_cond, batch, dist_mat, init_scaffold
+                z_rob, cond, edge_index, e_cond, batch, dist_mat, init_scaffold, attn_ctx
             )
 
         # 外部供給潜在（実 DiT 生成潜在）のデコード（学習時のみ・GT 不要のガードレール損失用）
         pos_ditcons: Optional[Tensor] = None
         if self.training and extra_latent is not None:
             pos_ditcons = self.decode(
-                extra_latent, cond, edge_index, e_cond, batch, dist_mat, init_scaffold
+                extra_latent, cond, edge_index, e_cond, batch, dist_mat, init_scaffold, attn_ctx
             )
         return pos_pred, mu, logvar, pos_robust, pos_ditcons
 

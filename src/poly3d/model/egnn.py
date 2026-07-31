@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch_scatter import scatter
 
-from poly3d.model.pos_bias import GraphDistanceBias, dist_to_onehot
+from poly3d.model.pos_bias import GraphDistanceBias, dist_to_onehot, N_DIST_CHANNELS
 
 
 _DIST_SQ_MAX: float = 100.0   # d² クランプ上限（√100 = 10 Å 相当）
@@ -25,6 +25,68 @@ _DIST_SQ_MAX: float = 100.0   # d² クランプ上限（√100 = 10 Å 相当�
 
 def _silu() -> nn.SiLU:
     return nn.SiLU()
+
+
+def build_egt_context(
+    batch: Optional[Tensor],
+    num_nodes: int,
+    device: torch.device,
+    dist_mat: Optional[Tensor] = None,
+) -> dict:
+    """
+    EGTLayer の大域アテンションで使う「z 非依存・batch/dist_mat のみ依存」の
+    コンテキストを 1 回だけ計算して返す（DiT の precompute_attn_inputs 式）。
+
+    毎レイヤー・毎 decode 呼び出しで再計算していた以下を集約する:
+      - 分子ごとのノード index リスト（Python ループ）
+      - gather_idx / pad_mask（パディング写像）
+      - dist_mat の long キャスト＋分子ブロック抽出＋dist_to_onehot
+
+    graph_bias の MLP はレイヤ固有パラメータのため各レイヤで適用するが、その入力と
+    なる one-hot（graph_onehot）まではここで確定させ、レイヤ側の Python ループを撤廃する。
+
+    戻り値 dict:
+      'gather_idx'   : (B, max_n) long   各 (mol, local_pos) → flat ノード index
+      'pad_mask'     : (B, max_n) bool   有効ノード = True
+      'graph_onehot' : (B, max_n, max_n, N_DIST_CHANNELS) float or None
+                       dist_mat 提供時のみ。分子ブロックのグラフ距離 one-hot（padding は 0）。
+    """
+    if batch is None:
+        batch = torch.zeros(num_nodes, dtype=torch.long, device=device)
+    B = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
+
+    # 分子ごとのノード index リスト（flat）
+    node_lists = [(batch == b).nonzero(as_tuple=True)[0] for b in range(B)]
+    counts = [nl.size(0) for nl in node_lists]
+    max_n = max(counts) if counts else 0
+    max_n = max(max_n, 1)
+
+    gather_idx = torch.zeros(B, max_n, dtype=torch.long, device=device)
+    pad_mask = torch.zeros(B, max_n, dtype=torch.bool, device=device)
+    for b, nl in enumerate(node_lists):
+        n_b = nl.size(0)
+        if n_b > 0:
+            gather_idx[b, :n_b] = nl
+            pad_mask[b, :n_b] = True
+
+    graph_onehot: Optional[Tensor] = None
+    if dist_mat is not None:
+        dm = dist_mat.long().to(device)
+        graph_onehot = torch.zeros(
+            B, max_n, max_n, N_DIST_CHANNELS, device=device,
+        )
+        for b, nl in enumerate(node_lists):
+            n_b = nl.size(0)
+            if n_b == 0:
+                continue
+            sub = dm[nl][:, nl]                  # (n_b, n_b)  分子ブロック
+            graph_onehot[b, :n_b, :n_b] = dist_to_onehot(sub)
+
+    return {
+        'gather_idx': gather_idx,
+        'pad_mask': pad_mask,
+        'graph_onehot': graph_onehot,
+    }
 
 
 class EGNNLayer(nn.Module):
@@ -234,18 +296,25 @@ class EGTLayer(nn.Module):
         self.graph_bias = GraphDistanceBias(n_heads)
 
         # g(d²): 3D 距離二乗 → ヘッドごとのアテンションバイアス（層ごとに動的再計算）
+        # スカラー(1)→n_heads の写像に hidden_dim 幅は不要。隠れ幅を小定数に固定して
+        # 中間テンソル (B,N,N,hidden_dim) の材料化を避ける（width256 VRAM 逼迫の直接原因）。
+        # GraphDistanceBias.mlp（n_heads*2）と同流儀の軽量幅。表現力への影響はほぼゼロ。
+        dist_bias_hidden = max(n_heads * 4, 32)
         self.dist_bias = nn.Sequential(
-            nn.Linear(1, hidden_dim),
+            nn.Linear(1, dist_bias_hidden),
             _silu(),
-            nn.Linear(hidden_dim, n_heads),
+            nn.Linear(dist_bias_hidden, n_heads),
         )
 
         # 座標重み φ_x（不変スカラー）。
         # pairwise C 次元テンソル (B, max_n, max_n, C) の材料化は破綻的コストのため撤廃。
         # 座標更新 Δx_i = Σ_j w_ij (x_i − x_j) は w_ij が不変量なら E(3) 同変が保たれる。
         # w_ij = mean_h(a_ij) · g(d_ij²) とし、g は d² スカラーのみを受ける軽量 MLP。
-        # coord_msg_dim は g の隠れ次元として流用（None → max(hidden//2,16)）。
-        C = coord_msg_dim if coord_msg_dim is not None else max(hidden_dim // 2, 16)
+        # coord_msg_dim は g の隠れ次元として流用（None → 小定数 16）。
+        # スカラー(d²)→スカラー(w)の写像に hidden//2(=128) 幅は過剰。中間テンソル
+        # (B,N,N,C) の材料化を抑えるため小さい固定値に下げる。w_ij はスカラーのままなので
+        # 座標更新 Δx_i = Σ_j w_ij (x_i−x_j) の E(3) 同変性・表現力に影響なし。
+        C = coord_msg_dim if coord_msg_dim is not None else 16
         self.coord_g = nn.Sequential(
             nn.Linear(1, C),
             _silu(),
@@ -267,6 +336,7 @@ class EGTLayer(nn.Module):
         edge_attr: Tensor,   # (E, edge_feat_dim)
         batch: Optional[Tensor] = None,  # (N,) バッチ割り当て
         dist_mat: Optional[Tensor] = None,  # (total_N, total_N) グラフ距離（任意）
+        attn_ctx: Optional[dict] = None,  # build_egt_context の戻り値（事前計算コンテキスト）
     ) -> Tuple[Tensor, Tensor]:
         """
         Returns
@@ -276,6 +346,10 @@ class EGTLayer(nn.Module):
 
         dist_mat が None の場合は b_graph 項を省略し、3D 距離バイアス g(d²) と
         batch ブロック対角マスクのみで動作する（後方互換）。
+
+        attn_ctx（build_egt_context の戻り値）が与えられれば gather_idx/pad_mask/
+        graph_onehot（batch・dist_mat のみ依存で z 非依存）の再計算を省略する。
+        None の場合は内部で 1 回だけ計算する（後方互換）。
         """
         # ─── 1. 局所チャンネル（結合エッジ沿い） ───
         h, x = self.local(h, x, edge_index, edge_attr, batch)
@@ -283,23 +357,15 @@ class EGTLayer(nn.Module):
         # ─── 2. 大域チャンネル（分子内全ペア・パディング式） ───
         N = h.size(0)
         device = h.device
-        if batch is None:
-            batch = torch.zeros(N, dtype=torch.long, device=device)
-        B = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
 
-        # 分子ごとのノード index → パディング（DiT precompute_attn_inputs 式）
-        node_lists = [(batch == b).nonzero(as_tuple=True)[0] for b in range(B)]
-        counts = [nl.size(0) for nl in node_lists]
-        max_n = max(counts) if counts else 0
-        max_n = max(max_n, 1)
-
-        gather_idx = torch.zeros(B, max_n, dtype=torch.long, device=device)
-        pad_mask = torch.zeros(B, max_n, dtype=torch.bool, device=device)
-        for b, nl in enumerate(node_lists):
-            n_b = nl.size(0)
-            if n_b > 0:
-                gather_idx[b, :n_b] = nl
-                pad_mask[b, :n_b] = True
+        # z 非依存コンテキスト（gather_idx/pad_mask/graph_onehot）を取得。
+        # 未提供時のみ内部計算（毎レイヤー再計算を避けるため呼び出し側で共有推奨）。
+        if attn_ctx is None:
+            attn_ctx = build_egt_context(batch, N, device, dist_mat)
+        gather_idx = attn_ctx['gather_idx']   # (B, max_n)
+        pad_mask = attn_ctx['pad_mask']       # (B, max_n)
+        graph_onehot = attn_ctx['graph_onehot']  # (B, max_n, max_n, 5) or None
+        B, max_n = gather_idx.shape
 
         # Q/K/V を (B, H, max_n, d) にパック
         q = self.q_proj(h).reshape(N, self.n_heads, self.head_dim)
@@ -322,19 +388,12 @@ class EGTLayer(nn.Module):
         g_bias = self.dist_bias(dist_sq.unsqueeze(-1))         # (B, max_n, max_n, H)
         logit = logit + g_bias.permute(0, 3, 1, 2)
 
-        # b_graph（任意入力）: dist_mat があればグラフ距離バイアスを加算
-        if dist_mat is not None:
-            dm = dist_mat.long().to(device)
-            gb = torch.zeros(B, self.n_heads, max_n, max_n, device=device, dtype=logit.dtype)
-            for b, nl in enumerate(node_lists):
-                n_b = nl.size(0)
-                if n_b == 0:
-                    continue
-                sub = dm[nl][:, nl]                 # (n_b, n_b)  分子ブロックを切り出す
-                oh = dist_to_onehot(sub)            # (n_b, n_b, 5)
-                lb = self.graph_bias(oh)            # (n_b, n_b, H)
-                gb[b, :, :n_b, :n_b] = lb.permute(2, 0, 1).to(gb.dtype)
-            logit = logit + gb
+        # b_graph（任意入力）: graph_onehot があればグラフ距離バイアスを加算。
+        # one-hot 抽出は build_egt_context 済み。ここでは層固有 MLP を padding 込みで
+        # 一括適用する（Python ループ撤廃）。padding 領域の値は下の pad_bias で無効化される。
+        if graph_onehot is not None:
+            gb = self.graph_bias(graph_onehot)      # (B, max_n, max_n, H)
+            logit = logit + gb.permute(0, 3, 1, 2).to(logit.dtype)
 
         # padding key を softmax から除外（分子間遮断はブロック構造で自動達成）
         pad_bias = torch.zeros(B, max_n, device=device, dtype=logit.dtype).masked_fill(~pad_mask, -1e9)

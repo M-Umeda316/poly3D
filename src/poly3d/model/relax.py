@@ -22,8 +22,9 @@ from typing import Optional
 
 import torch
 from torch import Tensor
+from torch_scatter import scatter_mean
 
-from poly3d.model.geo_losses import bond_range_loss, clash_loss
+from poly3d.model.geo_losses import enumerate_clash_pairs, guardrail_energy
 
 
 def relax_coords(pos0: Tensor, edge_index: Tensor, dist_mat: Tensor,
@@ -66,11 +67,25 @@ def relax_coords(pos0: Tensor, edge_index: Tensor, dist_mat: Tensor,
     if batch is None:
         batch = torch.zeros(N, dtype=torch.long, device=device)
 
-    # rvdw: 原子番号 → RDKit の van der Waals 半径（eval の _PT.GetRvdw と一致させる）
+    # rvdw: 原子番号 → RDKit の van der Waals 半径（eval の _PT.GetRvdw と一致させる）。
+    # 原子ごとに GetRvdw を逐次呼ぶ代わりに、バッチ中に実在する元素番号のみで
+    # ルックアップ表を 1 度構築し、index gather で全原子分を得る（高々 ~119 元素）。
+    # GetRvdw 呼び出しは「ユニーク元素数」回のみで、逐次版と数値は完全一致する。
     from rdkit import Chem
     pt = Chem.GetPeriodicTable()
-    rvdw = torch.tensor([pt.GetRvdw(int(z)) for z in atomic_nums.tolist()],
-                        device=device, dtype=torch.float32)
+    uniq_z = torch.unique(atomic_nums).tolist()               # 同期 1 回
+    max_z = int(max(uniq_z)) if uniq_z else 0
+    lut = torch.zeros(max_z + 1, dtype=torch.float32)         # CPU 上で構築
+    for z in uniq_z:
+        lut[int(z)] = pt.GetRvdw(int(z))
+    rvdw = lut.to(device)[atomic_nums.long()]                 # (N,) index gather
+
+    # clash ペアの厳密列挙はトポロジ（結合・グラフ距離）不変なので Adam ループの
+    # 外で 1 度だけ行い、毎ステップは座標更新のみに絞る（triu 再列挙と分子数 B 回の
+    # Python ループを除去）。数値は毎ステップ列挙する場合と完全一致する。
+    clash_pairs = enumerate_clash_pairs(
+        dist_mat, batch, ptr=ptr, min_graph_dist=min_graph_dist
+    )
 
     # 最適化変数（pos0 は勾配なしの参照点として保持し、x を動かす）
     x = pos0.detach().clone().requires_grad_(True)
@@ -78,16 +93,21 @@ def relax_coords(pos0: Tensor, edge_index: Tensor, dist_mat: Tensor,
 
     with torch.enable_grad():
         for _ in range(steps):
-            loss = (
-                w_clash * clash_loss(
-                    x, dist_mat, rvdw, batch, ptr=ptr,
-                    min_graph_dist=min_graph_dist, clash_factor=clash_factor,
-                    exact=True)
-                + w_bond * bond_range_loss(
-                    x, edge_index, batch, ptr=ptr,
-                    bond_lo=bond_lo, bond_hi=bond_hi)
-                + w_anchor * ((x - pos0) ** 2).sum(-1).mean()
+            # clash + bond ガードレール（列挙済みペアを使い回す）。per-term 重みは
+            # guardrail_energy が受け取る。
+            guard = guardrail_energy(
+                x, dist_mat, rvdw, batch, ptr, edge_index,
+                clash_factor=clash_factor, clash_min_graph_dist=min_graph_dist,
+                bond_lo=bond_lo, bond_hi=bond_hi, exact=True,
+                w_clash=w_clash, w_bond=w_bond, clash_pairs=clash_pairs,
             )
+            # アンカー項も clash/bond と同じ「分子ごと scatter_mean → 分子間平均」に
+            # 統一する。サイズ不均一バッチでアンカー vs 押し出しの相対強度が分子サイズに
+            # 依存してブレる問題を解消する（等分子重み）。
+            anchor_per_node = ((x - pos0) ** 2).sum(-1)             # (N,)
+            anchor = scatter_mean(anchor_per_node, batch, dim=0).mean()
+
+            loss = guard + w_anchor * anchor
             opt.zero_grad()
             loss.backward()
             opt.step()

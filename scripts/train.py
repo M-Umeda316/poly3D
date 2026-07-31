@@ -496,7 +496,15 @@ class VAETrainer:
         # サイズ・オーバーサンプリング（--size_index + --oversample_power）。
         # oversample_power=0 または size_index 未指定なら一切この経路に入らず
         # 従来動作（train_sampler=None / DDP時 DistributedSampler）を完全維持する。
+        # --oversample_alpha と両方有効な場合、こちらが無警告で self.train_sampler を
+        # 上書きしてしまうため、事前に警告を出しておく（挙動自体は変えない: 従来通り
+        # size_index 側が優先＝最後に設定した方が有効）。
         if args.size_index and args.oversample_power > 0:
+            if args.oversample_alpha > 0 and is_main_process():
+                print('[oversample] 警告: --oversample_alpha と --size_index'
+                      '+--oversample_power が両方指定されています。'
+                      'size_index 側の WeightedRandomSampler を優先し、'
+                      'oversample_alpha の指定は無視されます。', flush=True)
             self._setup_size_index_sampler(args, subset_idx)
 
         self.train_loader = make_dataloader(
@@ -694,7 +702,12 @@ class VAETrainer:
 
         power = float(args.oversample_power)
         # 重み: 大きい単位ほど高頻度。max(1.0, size) で欠損(0)や極小も最低 1.0 を保証。
-        w = np.maximum(1.0, sz.astype(np.float64)) ** power
+        # ただし max_atoms 超過レコードは __getitem__ で None（max_atoms フィルタ）
+        # になり collate で捨てられるだけなので、重みを 0 にして抽出対象から外す
+        # （_setup_oversampler の alpha 版と同様。0 にしないと最も高頻度で引かれる
+        # 大分子が毎回 None → 捨てられ、意図と逆に希薄化してしまう）。
+        w = np.where(sz <= args.max_atoms,
+                     np.maximum(1.0, sz.astype(np.float64)) ** power, 0.0)
 
         self.train_sampler = WeightedRandomSampler(
             weights=torch.as_tensor(w, dtype=torch.double),

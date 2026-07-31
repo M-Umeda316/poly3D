@@ -61,19 +61,40 @@ from poly3d.model.features import mol_to_data
 
 _BT = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE}
 
+# トリクリニック box 警告をクラス単位で1回だけ出すための既出集合（プロセス内で共有）
+_warned_triclinic_classes: set = set()
+
 
 # ── セル JSON → 単位 RDKit mol の切り出し ───────────────────────────────────────
 
-def cut_units_from_cell(cell: dict) -> Iterator[Tuple[str, "Chem.Mol"]]:
-    """1 セルの commonchem JSON から RU 単位を (residue_tag, H込みmol) で yield。"""
-    m = cell['molecules'][0]
+def cut_units_from_cell(cell: dict, uuid: str = '', class_name: str = '',
+                         skip: Optional[Counter] = None) -> Iterator[Tuple[str, "Chem.Mol"]]:
+    """1 セルの commonchem JSON から RU 単位を (residue_tag, H込みmol) で yield。
+
+    ``uuid``/``class_name``/``skip`` は観測性向上のためのオプション引数（後方互換：
+    省略時も従来どおり動作する）。PG クラスのような単純な cell（molecules/conformers
+    が各1件・box が直交）では警告は一切出ない。
+    """
+    if skip is None:
+        skip = Counter()
+
+    molecules = cell['molecules']
+    if len(molecules) > 1:
+        print(f'  [warn] {class_name}:{uuid} molecules={len(molecules)} 件 → 先頭のみ処理')
+        skip['multi_molecules'] += 1
+    m = molecules[0]
     z_def = cell.get('defaults', {}).get('atom', {}).get('z', 6)
     bo_def = cell.get('defaults', {}).get('bond', {}).get('bo', 1)
 
     atoms = m['atoms']
     N = len(atoms)
     Z = np.array([a.get('z', z_def) for a in atoms], dtype=int)
-    uw = np.array(m['conformers'][0]['coords'], dtype=float)  # 後で in-place アンラップ
+
+    conformers = m['conformers']
+    if len(conformers) > 1:
+        print(f'  [warn] {class_name}:{uuid} conformers={len(conformers)} 件 → 先頭のみ処理')
+        skip['multi_conformers'] += 1
+    uw = np.array(conformers[0]['coords'], dtype=float)  # 後で in-place アンラップ
 
     bonds = [(b['atoms'][0], b['atoms'][1], int(round(b.get('bo', bo_def)))) for b in m['bonds']]
 
@@ -85,6 +106,12 @@ def cut_units_from_cell(cell: dict) -> Iterator[Tuple[str, "Chem.Mol"]]:
 
     box = _find_box(m)
     L = np.array([box['xhi'] - box['xlo'], box['yhi'] - box['ylo'], box['zhi'] - box['zlo']])
+    tilt = [box.get(k, 0.0) for k in ('xy', 'xz', 'yz')]
+    if any(abs(t) > 1e-9 for t in tilt) and class_name not in _warned_triclinic_classes:
+        _warned_triclinic_classes.add(class_name)
+        print(f'  [warn] {class_name}:{uuid} トリクリニック箱を検出（xy/xz/yz={tilt}）'
+              f'→ 直交前提の PBC アンラップは不正確な可能性（このクラスは以降サイレント）')
+        skip['triclinic_box'] += 1
 
     adj = defaultdict(list)
     for i, j, _ in bonds:
@@ -125,11 +152,16 @@ def cut_units_from_cell(cell: dict) -> Iterator[Tuple[str, "Chem.Mol"]]:
             if i in idx_set and j in idx_set:
                 rw.AddBond(old2new[i], old2new[j], _BT.get(bo, Chem.BondType.SINGLE))
             elif i in idx_set:
-                severed.append((i, j))
+                severed.append((i, j, bo))
             elif j in idx_set:
-                severed.append((j, i))
+                severed.append((j, i, bo))
         cap_pos = []
-        for inside, outside in severed:
+        for inside, outside, bo in severed:
+            if bo != 1:
+                # 残基境界を跨ぐ結合が非単結合（二重/三重/芳香族）＝ H 単結合キャップは
+                # 価数を変える近似。共役主鎖クラスで SanitizeMol 失敗の主因になりうるため
+                # 可視化のみ行い、キャップ自体は従来どおり単結合のまま継続する。
+                skip['non_single_severed'] += 1
             hidx = rw.AddAtom(Chem.Atom(1))
             rw.AddBond(old2new[inside], hidx, Chem.BondType.SINGLE)
             v = uw[outside] - uw[inside]
@@ -259,12 +291,18 @@ def build(args) -> None:
 
     n_ok = 0
     n_cells = 0
-    skip = Counter()
+    # 新規カウンタは 0 件でもサマリに表示されるよう事前に seed しておく（観測性のため）
+    skip = Counter({'multi_molecules': 0, 'multi_conformers': 0, 'triclinic_box': 0,
+                    'non_single_severed': 0, 'topology_fallback': 0})
     for source in srcs:
+        class_name = Path(source).name
+        if class_name.endswith('.tar.gz'):
+            class_name = class_name[:-len('.tar.gz')]
         for uuid, cell in iter_cells(source, max_cells=args.max_cells_per_class):
             n_cells += 1
             props = csv_map.get(uuid)
-            for u, (tag, mol) in enumerate(cut_units_from_cell(cell)):
+            for u, (tag, mol) in enumerate(
+                    cut_units_from_cell(cell, uuid=uuid, class_name=class_name, skip=skip)):
                 if args.per_cell_stride > 1 and (u % args.per_cell_stride) != 0:
                     continue
                 if args.max_atoms and mol.GetNumAtoms() > args.max_atoms:
@@ -298,6 +336,7 @@ def build(args) -> None:
                     except Exception:
                         # トポロジー事前計算に失敗しても単位分子自体は保存する
                         # （dataset.py 側が起動時にフォールバック計算する）
+                        skip['topology_fallback'] += 1
                         dd.pop('dist_mat', None)
                         dd.pop('triplets', None)
                         dd.pop('quartets', None)
