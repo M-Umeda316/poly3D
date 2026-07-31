@@ -193,6 +193,11 @@ SMILES → ConditionalEncoder → h_cond, e_cond, Ci
 - VAE Decoder の初期座標は `init_pos MLP` で生成（全ゼロ禁止: EGNN の d²=0 問題）
 - DiT チェックポイントの `'flow'` キーは `LatentDiT.state_dict()` のみ（`model.*` プレフィックスなし）
 
+### 設計上の注記（文献照合レビュー 2026-07-31）
+
+- **同変性の方針は polyGen と逆**: polyGen（arXiv:2504.17656）は意図的に**非同変アーキテクチャ＋回転/並進 augmentation**を採用するが、本実装は **EGNN/EGT による明示的な SE(3)/置換同変性**に置き換えている（augmentation 不使用）。μ は不変量から計算され SE(3) 不変、座標出力は絶対姿勢不定・内部無矛盾で、Kabsch/distmat（回転不変損失）と数学的に整合。この相違は意図的な設計判断であり、polyGen の踏襲ではない。
+- **β の呼称**: beta を 0→0.1 に warm-up し 0.1 固定で運用するのは Bowman et al. 2016 型の **KL weight annealing / down-weighting**（posterior collapse 対策）であって、Higgins et al. 2017 の β-VAE（β>1・disentanglement 目的）とは方向が逆。ドキュメント上「β-VAE」と呼ばないこと。
+
 ## 計算効率
 
 - **BFS（グラフ距離行列）**: 純 Python のため高コスト。`precompute_attn_inputs()` を 1 バッチ 1 回だけ呼ぶこと（FlowMatching が自動で行う）
