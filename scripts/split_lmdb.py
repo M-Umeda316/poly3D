@@ -23,17 +23,32 @@ def main():
     ap.add_argument('--val_out', required=True)
     ap.add_argument('--val_every', type=int, default=20,
                     help='uuid の 1/val_every を val へ（決定的ハッシュ）')
-    ap.add_argument('--train_map_gb', type=int, default=8)
-    ap.add_argument('--val_map_gb', type=int, default=2)
+    ap.add_argument('--train_map_gb', type=int, default=0,
+                    help='0=src の実使用量から自動見積り（Windows では map_size がそのまま実確保される）')
+    ap.add_argument('--val_map_gb', type=int, default=0,
+                    help='0=src の実使用量から自動見積り')
     args = ap.parse_args()
 
     src = lmdb.open(args.src, subdir=False, readonly=True, lock=False, readahead=False)
     with src.begin() as txn:
         meta = txn.get(b'__len__')
         n = int(meta.decode()) if meta else txn.stat()['entries']
+        used = src.info()['last_pgno'] * txn.stat()['psize']
 
-    tr = lmdb.open(args.train_out, map_size=args.train_map_gb * 1024**3, subdir=False, map_async=True)
-    va = lmdb.open(args.val_out, map_size=args.val_map_gb * 1024**3, subdir=False, map_async=True)
+    # map_size は Windows では非 sparse で実確保されるため、固定既定値だと
+    # src が大きいとき MapFullError、小さいとき無駄にディスクを食う。src の
+    # 実使用バイト数から分割比で見積もる（0 指定時のみ）。
+    def _auto_gb(frac: float, margin: float) -> int:
+        return max(2, int(used * frac * margin / 1024 ** 3) + 1)
+
+    train_map_gb = args.train_map_gb or _auto_gb(1.0 - 1.0 / args.val_every, 1.15)
+    val_map_gb = args.val_map_gb or _auto_gb(1.0 / args.val_every, 1.60)
+    print(f'src used={used / 1024 ** 3:.1f} GiB / {n:,} rec -> '
+          f'map_size train={train_map_gb} GiB + val={val_map_gb} GiB '
+          f'(needs {train_map_gb + val_map_gb} GiB free disk)', flush=True)
+
+    tr = lmdb.open(args.train_out, map_size=train_map_gb * 1024**3, subdir=False, map_async=True)
+    va = lmdb.open(args.val_out, map_size=val_map_gb * 1024**3, subdir=False, map_async=True)
     ttxn, vtxn = tr.begin(write=True), va.begin(write=True)
     nt = nv = 0
     uuids_val = set()

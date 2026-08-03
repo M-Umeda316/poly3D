@@ -37,15 +37,32 @@ function Done($tag) {
     return (Test-Path $status) -and (Select-String -Path $status -Pattern $tag -Quiet)
 }
 
+# lmdb.open creates the file immediately (and on Windows really allocates map_size),
+# so a crashed build leaves a partial lmdb behind. A bare Test-Path would treat that
+# as reusable and split partial data. __len__ is only written after the build loop
+# completes, so use it as the completion marker.
+function LmdbComplete($path) {
+    if (-not (Test-Path $path)) { return $false }
+    & $py -c "import lmdb,sys; e=lmdb.open(sys.argv[1],subdir=False,readonly=True,lock=False); sys.exit(0 if e.begin().get(b'__len__') else 1)" $path 2>$null
+    return ($LASTEXITCODE -eq 0)
+}
+
 if (-not (Test-Path $out)) { New-Item -ItemType Directory -Force -Path $out | Out-Null }
 "START $(Get-Date -Format o) per_cell_stride=$PerCellStride max_atoms=$MaxAtoms map_size_gb=$MapSizeGb" |
     Out-File -Append -Encoding ascii $status
 
 # ---- Stage 1: BUILD (data/*.tar.gz -> polyomics_all.lmdb) ---------------------
 if (-not (Done "BUILD_DONE")) {
-    if (Test-Path $allLmdb) {
+    if (LmdbComplete $allLmdb) {
         "BUILD_DONE (reuse existing $allLmdb) $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
     } else {
+        if (Test-Path $allLmdb) {
+            # Leftover from a failed run: it keeps holding map_size bytes of disk and
+            # rebuilding over it would mix old and new keys. Remove before rebuilding.
+            "BUILD_STALE removing incomplete $allLmdb $(Get-Date -Format o)" |
+                Out-File -Append -Encoding ascii $status
+            Remove-Item $allLmdb, "$allLmdb-lock" -Force -ErrorAction SilentlyContinue
+        }
         "BUILD_START $(Get-Date -Format o) data_dir=$dataDir out=$allLmdb" | Out-File -Append -Encoding ascii $status
         & $py "scripts/build_polyomics_dataset.py" `
             --data_dir $dataDir --out_path $allLmdb `
