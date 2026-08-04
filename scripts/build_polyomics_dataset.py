@@ -64,6 +64,9 @@ _BT = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE
 # トリクリニック box 警告をクラス単位で1回だけ出すための既出集合（プロセス内で共有）
 _warned_triclinic_classes: set = set()
 
+# SanitizeMol 失敗を (クラス, 例外種別) ごとに1回だけ出すための既出集合
+_warned_sanitize: set = set()
+
 
 # ── セル JSON → 単位 RDKit mol の切り出し ───────────────────────────────────────
 
@@ -84,11 +87,16 @@ def cut_units_from_cell(cell: dict, uuid: str = '', class_name: str = '',
         skip['multi_molecules'] += 1
     m = molecules[0]
     z_def = cell.get('defaults', {}).get('atom', {}).get('z', 6)
+    chg_def = cell.get('defaults', {}).get('atom', {}).get('chg', 0)
     bo_def = cell.get('defaults', {}).get('bond', {}).get('bo', 1)
 
     atoms = m['atoms']
     N = len(atoms)
     Z = np.array([a.get('z', z_def) for a in atoms], dtype=int)
+    # commonchem は既定値と異なる原子にだけ chg を書く。ニトロ基は [N+](=O)[O-] と
+    # 電荷分離した形で格納されており、chg を落とすと中性 N の明示価数が 4 になって
+    # SanitizeMol が必ず失敗する（= そのポリマーが全 RU 丸ごと欠測する）。
+    CHG = np.array([a.get('chg', chg_def) for a in atoms], dtype=int)
 
     conformers = m['conformers']
     if len(conformers) > 1:
@@ -146,7 +154,10 @@ def cut_units_from_cell(cell: dict, uuid: str = '', class_name: str = '',
         old2new = {o: n for n, o in enumerate(idxs)}
         rw = Chem.RWMol()
         for o in idxs:
-            rw.AddAtom(Chem.Atom(int(Z[o])))
+            at = Chem.Atom(int(Z[o]))
+            if CHG[o]:
+                at.SetFormalCharge(int(CHG[o]))
+            rw.AddAtom(at)
         severed = []
         for i, j, bo in bonds:
             if i in idx_set and j in idx_set:
@@ -177,7 +188,15 @@ def cut_units_from_cell(cell: dict, uuid: str = '', class_name: str = '',
         mol.AddConformer(conf, assignId=True)
         try:
             Chem.SanitizeMol(mol)
-        except Exception:
+        except Exception as e:
+            # 握り潰すと RDKit の stderr 行だけが残ってクラス/uuid の文脈が失われ、
+            # skip サマリ上は全件成功に見えてしまう。必ず種別ごとに計上する。
+            kind = type(e).__name__
+            skip[f'sanitize:{class_name}:{kind}'] += 1
+            if (class_name, kind) not in _warned_sanitize:
+                _warned_sanitize.add((class_name, kind))
+                print(f'  [warn] {class_name}:{uuid} SanitizeMol 失敗 ({kind}): {e}'
+                      f' → この単位は除外（同種は以降サイレント、件数は skip に計上）')
             continue
         yield f'{mid}:{rn}', mol
 
