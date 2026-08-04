@@ -10,15 +10,15 @@ DiT 学習時はこの事前エンコード済み LMDB を使うことで、
 実行例:
   "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/precompute_latents.py \
       --vae_checkpoint ./runs/polygen_v1/vae_best.pt \
-      --src_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-      --out_lmdb D:/Dataset/OMol_base/OPoly26/latents/train.lmdb \
+      --src_lmdb data/polyomics_all_train.lmdb \
+      --out_lmdb data/polyomics_all_latents_train.lmdb \
       --batch_size 256 --num_workers 8
 
   # val も同様に
   "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/precompute_latents.py \
       --vae_checkpoint ./runs/polygen_v1/vae_best.pt \
-      --src_lmdb D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
-      --out_lmdb D:/Dataset/OMol_base/OPoly26/latents/val.lmdb \
+      --src_lmdb data/polyomics_all_val.lmdb \
+      --out_lmdb data/polyomics_all_latents_val.lmdb \
       --batch_size 256 --num_workers 8
 """
 from __future__ import annotations

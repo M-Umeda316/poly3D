@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## プロジェクト概要
 
 polyGen（arXiv:2504.17656）インスパイアのポリマー3D構造生成モデル。
-OPoly26 データセット（ASE lmdb 形式）を学習データとして使用。
+PolyOmics（RadonPy 古典 MD の非晶質構造 DB、HF `yhayashi1986/PolyOmics`）を学習データとして使用。
+非晶質セルの平衡構造から繰返し単位を切り出し、同一 SMILES の多数配座をアンサンブルとして学習する。
 
 - **入力**: 繰り返し単位の SMILES
 - **出力**: 繰り返し単位の 3D コンフォーマー（水素付き孤立分子）
@@ -21,7 +22,6 @@ OPoly26 データセット（ASE lmdb 形式）を学習データとして使用
 - OS: Windows 11（bash は Git Bash）
 - GPU: RTX 4060 Ti（CUDA 12.8）
 - 環境: `polygen`（torch 2.8 + torch-geometric + rdkit + lmdb + scipy）
-- **fairchem 不使用**（ASE lmdb を直接 zlib+JSON 読み込み）
 - 元素記号の取得は `Chem.GetPeriodicTable().GetElementSymbol(z)` を使用（`'X'` などのプレースホルダー不可）
 - src レイアウト: `pip install -e .` で `poly3d` パッケージとして editable install 必須
 
@@ -40,21 +40,28 @@ cd C:/Users/shanu/Documents/Python/poly3D
 "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/test_pipeline.py
 ```
 
-### 前処理（ASE lmdb → 処理済み lmdb）
+### 前処理（PolyOmics tar.gz → 処理済み lmdb → train/val 分割）
+
+`data/` に置いた `<CLASS>.tar.gz`（HF `yhayashi1986/PolyOmics` の `MD_snapshot_JSON`）を読む。
+本学習は `scripts/run_main_build.ps1` が下記2段をまとめて実行する（手順は `docs/MAIN_TRAINING.md`）。
 
 ```bash
-# val（小規模、まずここから試す）
-"C:/Users/shanu/anaconda3/envs/polygen/python.exe" -m poly3d.preprocess.build_dataset \
-    --src_dir D:/Dataset/OMol_base/OPoly26/val \
-    --out_path D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
-    --n_workers 8
+# 単一クラスで試す（--classes 省略で data/ 直下の全 tar.gz）
+"C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/build_polyomics_dataset.py \
+    --data_dir data/ --classes PG \
+    --out_path data/polyomics_PG.lmdb \
+    --precompute_topology --per_cell_stride 3 --max_atoms 288 --map_size_gb 40
 
-# train（大規模、数時間）
-"C:/Users/shanu/anaconda3/envs/polygen/python.exe" -m poly3d.preprocess.build_dataset \
-    --src_dir D:/Dataset/OMol_base/OPoly26/train \
-    --out_path D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --n_workers 8 --map_size_gb 80
+# uuid（＝ポリマー）単位で train/val 分割（同一 SMILES の train/val 漏洩を防ぐ）
+"C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/split_lmdb.py \
+    --src data/polyomics_PG.lmdb \
+    --train_out data/polyomics_PG_train.lmdb \
+    --val_out   data/polyomics_PG_val.lmdb
 ```
+
+- `--precompute_topology` で dist_mat/triplets/quartets を lmdb に埋め込む＝学習時の BFS が消える
+- `--per_cell_stride N` で 1 セル内の単位を N 個ごとに間引く（配座相関を減らしつつ容量抑制）
+- `split_lmdb.py` の `--train_map_gb/--val_map_gb` は既定 0＝src の実使用量から自動見積り
 
 ### 学習（2段階）
 
@@ -63,8 +70,8 @@ cd C:/Users/shanu/Documents/Python/poly3D
 # RTX4060Ti 16GB / Ryzen9 7900X 推奨設定
 "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/train.py \
     --stage vae \
-    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+    --train_lmdb data/polyomics_all_train.lmdb \
+    --val_lmdb   data/polyomics_all_val.lmdb \
     --out_dir    ./runs/polygen_v1 --epochs 300 \
     --batch_size 64 --num_workers 8 --grad_accum 2
 
@@ -74,15 +81,15 @@ cd C:/Users/shanu/Documents/Python/poly3D
 # Stage 1: Structural VAE（マルチ GPU: torchrun）
 torchrun --nproc_per_node=4 scripts/train.py \
     --stage vae \
-    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+    --train_lmdb data/polyomics_all_train.lmdb \
+    --val_lmdb   data/polyomics_all_val.lmdb \
     --out_dir    ./runs/polygen_v1 --epochs 300
 
 # Stage 2: Latent DiT（シングル GPU）
 "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/train.py \
     --stage dit \
-    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+    --train_lmdb data/polyomics_all_train.lmdb \
+    --val_lmdb   data/polyomics_all_val.lmdb \
     --out_dir    ./runs/polygen_v1 --epochs 600 \
     --vae_checkpoint ./runs/polygen_v1/vae_best.pt
 
@@ -121,23 +128,25 @@ poly3D/
 │   └── poly3d/                 # インストール可能パッケージ
 │       ├── data/
 │       │   └── dataset.py      # ConformerDataset（処理済み lmdb）
-│       ├── model/
-│       │   ├── features.py     # 特徴量定義・RWPE/LapPE 計算
-│       │   ├── egnn.py         # SE(3)-同変 GNN（汎用プリミティブ）
-│       │   ├── cond_encoder.py # Graph Conditioning（トポロジー→Ci）
-│       │   ├── vae.py          # Structural VAE（Encoder E + Decoder D）
-│       │   ├── geo_losses.py   # 幾何損失（bond/angle/dihedral/Kabsch RMSD/distmat）
-│       │   ├── vae_loss.py     # VAE 損失の組み立て
-│       │   ├── pos_bias.py     # グラフ距離 → attention bias
-│       │   ├── dit.py          # Latent DiT（block-diagonal attention）
-│       │   └── flow_matching.py # Flow matching（損失 + Euler ODE）
-│       └── preprocess/
-│           ├── lmdb_reader.py  # .aselmdb 直接読み込み（zlib+JSON）
-│           └── build_dataset.py # 前処理パイプライン（spawn multiprocessing）
+│       └── model/
+│           ├── features.py     # 特徴量定義・RWPE/LapPE 計算
+│           ├── egnn.py         # SE(3)-同変 GNN（汎用プリミティブ）
+│           ├── cond_encoder.py # Graph Conditioning（トポロジー→Ci）
+│           ├── vae.py          # Structural VAE（Encoder E + Decoder D）
+│           ├── geo_losses.py   # 幾何損失（bond/angle/dihedral/Kabsch RMSD/distmat）
+│           ├── vae_loss.py     # VAE 損失の組み立て
+│           ├── pos_bias.py     # グラフ距離 → attention bias
+│           ├── dit.py          # Latent DiT（block-diagonal attention）
+│           └── flow_matching.py # Flow matching（損失 + Euler ODE）
 ├── scripts/
+│   ├── build_polyomics_dataset.py # PolyOmics tar.gz → 処理済み lmdb
+│   ├── split_lmdb.py           # uuid 単位で train/val 分割
 │   ├── train.py                # 2段階学習（VAETrainer / DiTTrainer）
 │   ├── sample.py               # 推論（SMILES → SDF）
+│   ├── eval_ensemble.py        # 妥当性評価（全体・サイズ帯別）
+│   ├── run_main_*.ps1          # 本学習ランチャ4段（build/vae/dit/ditcons）
 │   └── test_pipeline.py        # 動作確認（4 テスト）
+├── docs/MAIN_TRAINING.md       # 本学習の手順書
 └── pyproject.toml              # パッケージ定義（src レイアウト）
 ```
 
@@ -185,7 +194,8 @@ SMILES → ConditionalEncoder → h_cond, e_cond, Ci
 
 ## 注意事項
 
-- Windows multiprocessing は `spawn` 必須（`build_dataset.py`）
+- PolyOmics の commonchem JSON は既定値と異なる原子にだけ `chg` を書く。ニトロ基は `[N+](=O)[O-]` と電荷分離して格納されているので、`chg` を落とすと中性 N の明示価数が 4 になり `SanitizeMol` が必ず失敗する（＝そのポリマーが全 RU 丸ごと欠測する）
+- Windows の LMDB は `map_size` を非 sparse で実確保する。`map_size_gb` を上げた分だけディスクが即座に消える（split はソースと出力が同時に載るのでピークは約 2.2 倍）
 - DataLoader の `num_workers > 0` 時は worker ごとに lmdb env を開く（`worker_init_fn`）
 - 元素記号には必ず `Chem.GetPeriodicTable().GetElementSymbol(z)` を使う（`'X'` 不可）
 - RWPE は scipy.sparse で計算（scipy は polygen env に含まれる）

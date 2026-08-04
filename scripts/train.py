@@ -7,8 +7,8 @@ Stage 2: Latent DiT (Flow Matching)
 【シングル GPU】
   "C:/Users/shanu/anaconda3/envs/polygen/python.exe" scripts/train.py \
       --stage vae \
-      --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-      --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+      --train_lmdb data/polyomics_all_train.lmdb \
+      --val_lmdb   data/polyomics_all_val.lmdb \
       --out_dir    ./runs/polygen_v1 --epochs 300
 
 【マルチ GPU（単一ノード、4GPU の例）】
@@ -336,7 +336,7 @@ def parse_args() -> argparse.Namespace:
                    help='訓練データのサブセット比率 (0 < r ≤ 1.0)')
     p.add_argument('--val_subset_ratio', type=float, default=1.0,
                    help='学習中の val loss 監視用サブセット比率 (0 < r ≤ 1.0)。'
-                        'best ckpt 選択・監視用の指標なので小さくてよい（本評価は eval_by_size.py で別途実施）。'
+                        'best ckpt 選択・監視用の指標なので小さくてよい（本評価は eval_ensemble.py で別途実施）。'
                         'デフォルト 1.0 は全 val を使用（従来動作）')
 
     # 大分子オーバーサンプリング（VAE stage 専用）
@@ -520,7 +520,7 @@ class VAETrainer:
         )
         # val も分散時は DistributedSampler で分割（全ランク重複処理の無駄を排除）。
         # shuffle=False。各ランクのバッチ数差は _all_reduce_dict の加重平均で吸収される。
-        # val 監視用サブセット（best ckpt 選択・監視用。本評価は eval_by_size.py で別途）
+        # val 監視用サブセット（best ckpt 選択・監視用。本評価は eval_ensemble.py で別途）
         val_subset_idx: Optional[list] = None
         if args.val_subset_ratio < 1.0:
             from poly3d.data.dataset import ConformerDataset as _CDS

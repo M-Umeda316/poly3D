@@ -1,7 +1,7 @@
 """
 DiT 生成配座の品質評価スクリプト。
 
-VAE 再構築（evaluate_vae.py / eval_by_size.py）ではなく、**DiT からサンプルした
+VAE 再構築（evaluate_vae.py）ではなく、**DiT からサンプルした
 生成配座**の品質を測る。sample.py の生成経路（cond_encoder → flow.sample →
 vae.decode、n_conf ブロック対角複製・EGT/MDS ゲート）をそのまま lmdb 分子に適用し、
 以下の 2 系統で評価する。
@@ -60,7 +60,7 @@ from evaluate_vae import _kabsch_rmsd_single, _bond_rmse, _load_models
 
 RDLogger.DisableLog('rdApp.*')   # SanitizeMol のエラーログを抑制（成否のみ使う）
 
-# サイズ帯別 bins（eval_by_size.py と同一）
+# サイズ帯別 bins（eval_ensemble.py のサイズ帯集約と揃えること）
 BINS = [0, 40, 60, 80, 100, 130, 170, 240, 10000]
 
 # bond_type_idx → RDKit BondType（features.py: 0=SINGLE,1=DOUBLE,2=TRIPLE,3=AROMATIC,4=OTHER）

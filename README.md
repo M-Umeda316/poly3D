@@ -3,7 +3,8 @@
 polyGen（[arXiv:2504.17656](https://arxiv.org/abs/2504.17656)）インスパイアのポリマー繰り返し単位 3D 構造生成モデル。
 
 SMILES を入力として、水素付き孤立分子の 3D コンフォーマーを生成する。
-学習データには OPoly26（[arXiv:2512.23117](https://arxiv.org/abs/2512.23117)）を使用。
+学習データには PolyOmics（RadonPy 古典 MD による非晶質構造 DB、HuggingFace [`yhayashi1986/PolyOmics`](https://huggingface.co/datasets/yhayashi1986/PolyOmics)）を使用。
+非晶質セルの平衡構造から繰返し単位を切り出すため、同一 SMILES に対して多数の配座が得られ、そのままアンサンブル学習になる。
 
 ## アーキテクチャ概要
 
@@ -57,21 +58,25 @@ pip install -e .
 
 ## データ準備
 
-OPoly26 の `.aselmdb` から処理済み lmdb を生成する。
+PolyOmics の `<CLASS>.tar.gz`（HF の `MD_snapshot_JSON`）を `data/` に置き、処理済み lmdb を生成する。
+全22クラスの本学習は `scripts/run_main_build.ps1` が下記2段をまとめて実行する（手順は `docs/MAIN_TRAINING.md`）。
 
 ```bash
-# val（動作確認用）
-python -m poly3d.preprocess.build_dataset \
-    --src_dir  D:/Dataset/OMol_base/OPoly26/val \
-    --out_path D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
-    --n_workers 8
+# 単一クラスで試す（--classes 省略で data/ 直下の全 tar.gz）
+python scripts/build_polyomics_dataset.py \
+    --data_dir data/ --classes PG \
+    --out_path data/polyomics_PG.lmdb \
+    --precompute_topology --per_cell_stride 3 --max_atoms 288 --map_size_gb 40
 
-# train（大規模、数時間）
-python -m poly3d.preprocess.build_dataset \
-    --src_dir  D:/Dataset/OMol_base/OPoly26/train \
-    --out_path D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --n_workers 8 --map_size_gb 80
+# uuid（＝ポリマー）単位で train/val 分割し、同一 SMILES の漏洩を防ぐ
+python scripts/split_lmdb.py \
+    --src data/polyomics_PG.lmdb \
+    --train_out data/polyomics_PG_train.lmdb \
+    --val_out   data/polyomics_PG_val.lmdb
 ```
+
+`--precompute_topology` は dist_mat / triplets / quartets を lmdb に埋め込み、学習時の BFS を無くす。
+`--per_cell_stride N` は 1 セル内の単位を N 個ごとに間引く（配座相関を減らしつつ容量を抑える）。
 
 ## 学習
 
@@ -81,16 +86,16 @@ python -m poly3d.preprocess.build_dataset \
 # シングル GPU（RTX4060Ti 16GB 推奨設定）
 python scripts/train.py \
     --stage vae \
-    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+    --train_lmdb data/polyomics_all_train.lmdb \
+    --val_lmdb   data/polyomics_all_val.lmdb \
     --out_dir    ./runs/polygen_v1 \
     --epochs 300 \
     --batch_size 64 --num_workers 8 --grad_accum 2
 
 # マルチ GPU（torchrun）
 torchrun --nproc_per_node=4 scripts/train.py --stage vae \
-    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+    --train_lmdb data/polyomics_all_train.lmdb \
+    --val_lmdb   data/polyomics_all_val.lmdb \
     --out_dir    ./runs/polygen_v1 --epochs 300
 ```
 
@@ -101,8 +106,8 @@ torchrun --nproc_per_node=4 scripts/train.py --stage vae \
 ```bash
 python scripts/train.py \
     --stage dit \
-    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+    --train_lmdb data/polyomics_all_train.lmdb \
+    --val_lmdb   data/polyomics_all_val.lmdb \
     --out_dir    ./runs/polygen_v1 \
     --vae_checkpoint ./runs/polygen_v1/vae_best.pt \
     --epochs 600 \
@@ -117,23 +122,23 @@ ConditionalEncoder + VAE Encoder の推論コストを事前にキャッシュ�
 # 1. 潜在変数を事前エンコード
 python scripts/precompute_latents.py \
     --vae_checkpoint ./runs/polygen_v1/vae_best.pt \
-    --src_lmdb  D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --out_lmdb  D:/Dataset/OMol_base/OPoly26/latents/train.lmdb \
+    --src_lmdb  data/polyomics_all_train.lmdb \
+    --out_lmdb  data/polyomics_all_latents_train.lmdb \
     --batch_size 256 --num_workers 8
 
 python scripts/precompute_latents.py \
     --vae_checkpoint ./runs/polygen_v1/vae_best.pt \
-    --src_lmdb  D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
-    --out_lmdb  D:/Dataset/OMol_base/OPoly26/latents/val.lmdb \
+    --src_lmdb  data/polyomics_all_val.lmdb \
+    --out_lmdb  data/polyomics_all_latents_val.lmdb \
     --batch_size 256 --num_workers 8
 
 # 2. キャッシュ済み LMDB で DiT 学習
 python scripts/train.py \
     --stage dit \
-    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
-    --latent_lmdb     D:/Dataset/OMol_base/OPoly26/latents/train.lmdb \
-    --latent_val_lmdb D:/Dataset/OMol_base/OPoly26/latents/val.lmdb \
+    --train_lmdb data/polyomics_all_train.lmdb \
+    --val_lmdb   data/polyomics_all_val.lmdb \
+    --latent_lmdb     data/polyomics_all_latents_train.lmdb \
+    --latent_val_lmdb data/polyomics_all_latents_val.lmdb \
     --out_dir    ./runs/polygen_v1 \
     --vae_checkpoint ./runs/polygen_v1/vae_best.pt \
     --epochs 600 \
@@ -218,8 +223,8 @@ tensorboard --logdir ./runs/polygen_v1
 ```bash
 python scripts/train.py \
     --stage vae \
-    --train_lmdb D:/Dataset/OMol_base/OPoly26/processed/train.lmdb \
-    --val_lmdb   D:/Dataset/OMol_base/OPoly26/processed/val.lmdb \
+    --train_lmdb data/polyomics_all_train.lmdb \
+    --val_lmdb   data/polyomics_all_val.lmdb \
     --out_dir ./runs/bench \
     --batch_size 64 --benchmark 20
 ```
@@ -260,32 +265,35 @@ poly3D/
 │       ├── data/
 │       │   ├── dataset.py          # ConformerDataset（処理済み lmdb → PyG Batch）
 │       │   └── latent_dataset.py   # LatentDataset（事前エンコード済み lmdb）
-│       ├── model/
-│       │   ├── features.py         # 特徴量定義・RWPE/LapPE 計算・mol→dict
-│       │   ├── egnn.py             # SE(3)-equivariant GNN
-│       │   ├── cond_encoder.py     # Graph Conditioning（MPNN + mean global pooling）
-│       │   ├── vae.py              # Structural VAE（Encoder + Decoder）
-│       │   ├── geo_losses.py       # 幾何損失（bond / angle / dihedral / Kabsch RMSD / distmat）
-│       │   ├── vae_loss.py         # VAE 損失の組み立て
-│       │   ├── pos_bias.py         # グラフ距離 → attention bias
-│       │   ├── dit.py              # Latent DiT
-│       │   ├── flow_matching.py    # Flow matching（損失 + Euler ODE）
-│       │   └── builder.py          # モデル構築ファクトリ（train/sample 共用）
-│       └── preprocess/
-│           ├── lmdb_reader.py      # .aselmdb 読み込み（zlib+JSON）
-│           └── build_dataset.py    # 前処理パイプライン
+│       └── model/
+│           ├── features.py         # 特徴量定義・RWPE/LapPE 計算・mol→dict
+│           ├── egnn.py             # SE(3)-equivariant GNN
+│           ├── cond_encoder.py     # Graph Conditioning（MPNN + mean global pooling）
+│           ├── vae.py              # Structural VAE（Encoder + Decoder）
+│           ├── geo_losses.py       # 幾何損失（bond / angle / dihedral / Kabsch RMSD / distmat）
+│           ├── vae_loss.py         # VAE 損失の組み立て
+│           ├── pos_bias.py         # グラフ距離 → attention bias
+│           ├── dit.py              # Latent DiT
+│           ├── flow_matching.py    # Flow matching（損失 + Euler ODE）
+│           └── builder.py          # モデル構築ファクトリ（train/sample 共用）
 ├── scripts/
+│   ├── build_polyomics_dataset.py  # PolyOmics tar.gz → 処理済み lmdb
+│   ├── split_lmdb.py               # uuid 単位で train/val 分割
 │   ├── train.py                    # 学習エントリポイント（VAETrainer / DiTTrainer）
 │   ├── sample.py                   # 推論エントリポイント
 │   ├── precompute_latents.py       # 事前エンコード（DiT Stage 2 高速化用）
+│   ├── eval_ensemble.py            # 妥当性評価（全体・サイズ帯別）
+│   ├── run_main_*.ps1              # 本学習ランチャ4段（build/vae/dit/ditcons）
 │   └── test_pipeline.py            # 動作確認テスト（4 項目）
+├── docs/MAIN_TRAINING.md           # 本学習の手順書
 └── pyproject.toml
 ```
 
 ## 参考文献
 
 - **polyGen**: Ruan et al., "polyGen: A Conditional Generative Model for Polymer 3D Structures", arXiv:2504.17656 (2025)
-- **OPoly26**: arXiv:2512.23117 (2024)
+- **PolyOmics**: RadonPy 古典 MD（GAFF2 / 300K）による非晶質ポリマー構造 DB、HuggingFace `yhayashi1986/PolyOmics`
+- **RadonPy**: Hayashi et al., "RadonPy: automated physical property calculation using all-atom classical molecular dynamics simulations for polymer informatics", npj Comput. Mater. 8, 222 (2022)
 - **EGNN**: Satorras et al., "E(n) Equivariant Graph Neural Networks", ICML 2021
 - **RWPE**: Dwivedi et al., "Graph Neural Networks with Learnable Structural and Positional Representations", ICLR 2022
 - **Flow Matching**: Lipman et al., "Flow Matching for Generative Modeling", ICLR 2023
