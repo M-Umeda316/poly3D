@@ -137,7 +137,7 @@ poly3D/
 ├── scripts/
 │   ├── train.py                # 2段階学習（VAETrainer / DiTTrainer）
 │   ├── sample.py               # 推論（SMILES → SDF）
-│   └── test_pipeline.py        # 動作確認（6 テスト）
+│   └── test_pipeline.py        # 動作確認（4 テスト）
 └── pyproject.toml              # パッケージ定義（src レイアウト）
 ```
 

@@ -249,7 +249,7 @@ python scripts/sample.py \
 python scripts/test_pipeline.py
 ```
 
-6 テスト（lmdb_reader / features / cond_encoder / vae / dit+flow / preprocess）が全て `[ OK ]` になれば環境構築完了。
+4 テスト（features / cond_encoder / vae / dit+flow）が全て `[ OK ]` になれば環境構築完了。
 
 ## ディレクトリ構成
 
@@ -278,7 +278,7 @@ poly3D/
 │   ├── train.py                    # 学習エントリポイント（VAETrainer / DiTTrainer）
 │   ├── sample.py                   # 推論エントリポイント
 │   ├── precompute_latents.py       # 事前エンコード（DiT Stage 2 高速化用）
-│   └── test_pipeline.py            # 動作確認テスト（6 項目）
+│   └── test_pipeline.py            # 動作確認テスト（4 項目）
 └── pyproject.toml
 ```
 

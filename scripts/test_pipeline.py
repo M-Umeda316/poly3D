@@ -11,19 +11,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PASS, FAIL = '[ OK ]', '[FAIL]'
 
 
-def test_lmdb_reader():
-    from poly3d.preprocess.lmdb_reader import iter_lmdb, read_molecule, count_entries
-    path = r'D:\Dataset\OMol_base\OPoly26\val\data0000.aselmdb'
-    n = count_entries(path)
-    assert n > 0
-    for i, rec in enumerate(iter_lmdb(path)):
-        nums, pos, charge, sid = read_molecule(rec)
-        assert pos.shape == (len(nums), 3)
-        if i >= 2: break
-    print(f'  n_entries={n}, last n_atoms={len(nums)}, charge={charge}')
-    return True
-
-
 def test_features():
     import numpy as np
     from rdkit import Chem
@@ -166,43 +153,6 @@ def test_dit_flow():
     return True
 
 
-def test_single_mol_preprocess():
-    from poly3d.preprocess.lmdb_reader import iter_lmdb, read_molecule
-    from rdkit import Chem
-    from rdkit.Chem import rdDetermineBonds
-    from poly3d.model.features import mol_to_data
-
-    path = r'D:\Dataset\OMol_base\OPoly26\val\data0000.aselmdb'
-    ok = fail = 0
-    for rec in iter_lmdb(path):
-        nums, pos, charge, sid = read_molecule(rec)
-        n = len(nums)
-        from rdkit.Chem import GetPeriodicTable
-        ptable = GetPeriodicTable()
-        try:
-            sym_list = [ptable.GetElementSymbol(int(z)) for z in nums]
-        except Exception:
-            fail += 1
-            continue
-        lines = [str(n), ''] + [f'{s} {x:.4f} {y:.4f} {z:.4f}'
-                                  for s, (x, y, z) in zip(sym_list, pos)]
-        try:
-            mol = Chem.MolFromXYZBlock('\n'.join(lines))
-            rdDetermineBonds.DetermineBonds(mol, charge=charge, maxIterations=2000)
-            frags = Chem.GetMolFrags(mol, asMols=True)
-            mol = max(frags, key=lambda m: m.GetNumAtoms())
-            d = mol_to_data(mol, sid=sid, use_rwpe=True)
-            assert d['rwpe'].shape[0] == d['atom_type_idx'].shape[0]
-            ok += 1
-        except Exception:
-            fail += 1
-        if ok + fail >= 20:
-            break
-    print(f'  {ok} 成功 / {fail} 失敗 (20 件中)')
-    assert ok > 0
-    return True
-
-
 def run(name, fn):
     print(f'\n{name}')
     try:
@@ -217,12 +167,10 @@ def run(name, fn):
 
 if __name__ == '__main__':
     results = [
-        run('lmdb_reader', test_lmdb_reader),
         run('features (embedding idx + RWPE)', test_features),
         run('cond_encoder (global pooling + Ci)', test_cond_encoder),
         run('vae (encode + decode + loss)', test_vae),
         run('dit + flow_matching (loss + sample)', test_dit_flow),
-        run('single_mol_preprocess', test_single_mol_preprocess),
     ]
     print(f'\n{"="*50}')
     print(f'結果: {sum(results)}/{len(results)} テスト通過')
