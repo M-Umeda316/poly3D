@@ -333,7 +333,22 @@ def parse_args() -> argparse.Namespace:
 
     # ハイパーパラメータ探索用
     p.add_argument('--subset_ratio', type=float, default=1.0,
-                   help='訓練データのサブセット比率 (0 < r ≤ 1.0)')
+                   help='訓練データのサブセット比率 (0 < r ≤ 1.0)。'
+                        '**seed から一度だけ選ばれた固定サブセット**で、エポックごとに'
+                        '引き直さない＝残りのデータは run 中ずっと使われない。'
+                        'データを捨てずに 1 エポックを短くしたいだけなら'
+                        '--steps_per_epoch を使うこと。')
+    p.add_argument('--steps_per_epoch', type=int, default=0,
+                   help='train の 1 エポックを先頭 N バッチで打ち切る（0=無効＝全件走査）。'
+                        '**仮想エポック**: shuffle は毎エポック引き直されるので、'
+                        '打ち切られても毎回違う N バッチを見る（--subset_ratio の'
+                        '固定サブセットとは別物でデータは捨てない）。\n'
+                        '目的は epoch 基準のスケジュールの分解能を保つこと。'
+                        'CosineAnnealingLR は epoch ごとに 1 回、beta warmup は '
+                        '(epoch-1)/warmup、val・ckpt も epoch 単位なので、'
+                        '数百万件のデータで epochs=3 のような設定にすると LR も beta も'
+                        '3 点の階段になり、best ckpt も 3 個から選ぶことになる。'
+                        '1 エポックを数千 step に切って epochs を増やせば解決する。')
     p.add_argument('--val_subset_ratio', type=float, default=1.0,
                    help='学習中の val loss 監視用サブセット比率 (0 < r ≤ 1.0)。'
                         'best ckpt 選択・監視用の指標なので小さくてよい（本評価は eval_ensemble.py で別途実施）。'
@@ -800,6 +815,10 @@ class VAETrainer:
         sums: dict = {}
         n = 0   # 処理済みバッチ数
         n_batches = len(loader)
+        # 仮想エポック: train のみ N バッチで打ち切る。n_batches をここで縮めておくと
+        # is_last_step（勾配累積の端数フラッシュ）も打ち切り位置で正しく立つ。
+        if train and self.args.steps_per_epoch > 0:
+            n_batches = min(n_batches, self.args.steps_per_epoch)
         accum = self.args.grad_accum
         tb_every = self.args.tb_log_every
         self._gnorm_sum = 0.0
@@ -814,11 +833,13 @@ class VAETrainer:
         # stderr がファイル等の非TTYへリダイレクトされている場合はバーを自動無効化
         # （ログにCR更新スパムを残さない。コンソール実行時のみ表示）。
         _tty = bool(getattr(sys.stderr, 'isatty', lambda: False)())
-        pbar = tqdm(loader, desc='Train' if train else 'Val',
+        pbar = tqdm(loader, desc='Train' if train else 'Val', total=n_batches,
                     leave=False, dynamic_ncols=True,
                     disable=(not is_main_process()) or not _tty)
 
         for step, batch in enumerate(pbar):
+            if step >= n_batches:
+                break
             if batch is None:
                 continue
 
@@ -1321,6 +1342,9 @@ class DiTTrainer:
         sums: dict = {}
         n = 0
         n_batches = len(loader)
+        # 仮想エポック（VAE 側と同じ。詳細は --steps_per_epoch のヘルプ）。
+        if train and self.args.steps_per_epoch > 0:
+            n_batches = min(n_batches, self.args.steps_per_epoch)
         accum = self.args.grad_accum
         tb_every = self.args.tb_log_every
 
@@ -1330,11 +1354,13 @@ class DiTTrainer:
         # stderr がファイル等の非TTYへリダイレクトされている場合はバーを自動無効化
         # （ログにCR更新スパムを残さない。コンソール実行時のみ表示）。
         _tty = bool(getattr(sys.stderr, 'isatty', lambda: False)())
-        pbar = tqdm(loader, desc='Train' if train else 'Val',
+        pbar = tqdm(loader, desc='Train' if train else 'Val', total=n_batches,
                     leave=False, dynamic_ncols=True,
                     disable=(not is_main_process()) or not _tty)
 
         for step, batch in enumerate(pbar):
+            if step >= n_batches:
+                break
             if batch is None:
                 continue
 
@@ -1530,6 +1556,10 @@ def _benchmark_vae(trainer: VAETrainer, n_batches: int):
 
     if use_cuda:
         torch.cuda.synchronize(device)
+        # ピーク VRAM もここで測る。EGT の大域 attention は (B, N_max, N_max) の密
+        # テンソルなので VRAM は batch_size × バッチ内最大原子数^2 で効き、机上の
+        # 外挿は当てにならない。--benchmark で実測して batch_size を決めること。
+        torch.cuda.reset_peak_memory_stats(device)
 
     warmup = 3
     loader_iter = iter(trainer.train_loader)
@@ -1657,6 +1687,10 @@ def _benchmark_dit(trainer: DiTTrainer, n_batches: int):
 
     if use_cuda:
         torch.cuda.synchronize(device)
+        # ピーク VRAM もここで測る。EGT の大域 attention は (B, N_max, N_max) の密
+        # テンソルなので VRAM は batch_size × バッチ内最大原子数^2 で効き、机上の
+        # 外挿は当てにならない。--benchmark で実測して batch_size を決めること。
+        torch.cuda.reset_peak_memory_stats(device)
 
     warmup = 3
     loader_iter = iter(trainer.train_loader)
@@ -1786,6 +1820,14 @@ def _print_benchmark(timings: dict, n_batches: int, total_batches_per_epoch: int
     print(f'\n  平均バッチ時間: {avg_per_batch*1000:.1f} ms')
     print(f'  1エポック推定 : {est_epoch:.0f}s ({est_h:.1f}h)')
     print(f'  (全 {total_batches_per_epoch} バッチ)')
+    if torch.cuda.is_available():
+        # batch_size を決める材料。reserved がカード容量に対して余裕があるかを見る。
+        # ただし計測は n_batches 分のサンプルなので、原子数分布の裾（稀に来る
+        # max_atoms 級のバッチ）は引き切れていない可能性がある＝実運用ピークは
+        # これより上振れしうる。--oom_max_skips を併用する前提で読むこと。
+        print(f'  ピーク VRAM   : '
+              f'alloc={torch.cuda.max_memory_allocated()/1e9:.2f}GB '
+              f'reserved={torch.cuda.max_memory_reserved()/1e9:.2f}GB')
     print(f'{"="*60}\n')
 
 

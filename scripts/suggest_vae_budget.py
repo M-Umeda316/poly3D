@@ -35,11 +35,22 @@ import random
 
 import lmdb
 
-# PG パイロット（v3c）の実測基準点: bs64 / バッチ内最大 60 原子程度で
-# reserved 11.5GB。padded attention は B*N^2 で効くので、この積を 1.0 とした
-# 相対指数で本データの bs を評価する。
-PG_PAD_INDEX = 64 * 60 * 60
-PG_RESERVED_GB = 11.5
+# VRAM モデル: alloc_GB = K * batch_size * N_pad^2
+#   N_pad = そのバッチ内の最大原子数（EGT の大域 attention が (B,N,N) の密テンソル
+#   なので、1 件でも大きい分子が混ざると全件そこまでパディングされる）
+#
+# K は現行コードの実測から回帰（2026-08-06, RTX4060Ti, width256/edge128/egt_every2,
+# PG lmdb, --benchmark 10）:
+#   bs64 -> alloc 0.84GB / bs128 -> 1.82GB / bs256 -> 3.47GB, N_pad ~79
+#   → 定数項ほぼ 0、K = 2.2e-6 [GB / (sample * atom^2)]
+# reserved は alloc の約 1.45 倍（キャッシュ・フラグメント込み）。
+#
+# 注意: 旧版はこの基準に v3c 実行時の reserved 11.5GB を使っていたが、あれは
+# EGT の dist_bias 修正**前**の値で、現行コードでは約 1/10 に下がっている。
+# 古い実測値を基準に据えると見積りが桁で過大になるので、係数を更新するときは
+# 必ず現行コードの --benchmark を取り直すこと。
+K_GB_PER_SAMPLE_ATOM2 = 2.2e-6
+RESERVED_OVER_ALLOC = 1.45
 
 
 def lmdb_len(path: str) -> int:
@@ -100,6 +111,11 @@ def main() -> None:
                         '22 クラスは多様性が上がるのでその 2 倍を既定にしている。')
     p.add_argument('--val_target', type=int, default=20000,
                    help='1 回の validation で回したいサンプル数の目安。')
+    p.add_argument('--target_epochs', type=int, default=40,
+                   help='epoch 基準スケジュール（cosine LR / beta warmup / val / ckpt）の'
+                        '分解能。本データは 1 パスが数万 step あるので、全件走査を'
+                        '1 epoch にすると epochs が数回しか取れず全部が階段になる。'
+                        'ここで決めた epoch 数になるよう steps_per_epoch を逆算する。')
     p.add_argument('--sample', type=int, default=3000,
                    help='原子数分布の推定に使うサンプル件数。')
     p.add_argument('--seed', type=int, default=0)
@@ -118,15 +134,33 @@ def main() -> None:
 
     p50, p95, p99, smax = pct(kept, .50), pct(kept, .95), pct(kept, .99), max(kept)
 
-    steps_per_epoch = max(1, n_eff // a.batch_size)
-    epochs = max(3, round(a.target_steps / steps_per_epoch))
+    full_pass = max(1, n_eff // a.batch_size)      # 全件 1 パスの step 数
+
+    # epoch 基準のスケジュールが階段にならないよう、まず epoch 数を決めてから
+    # 1 epoch の step 数を逆算する（仮想エポック = train.py --steps_per_epoch）。
+    # 全件 1 パスが目標 epoch あたりの step 数より短いなら、仮想エポックは不要。
+    epochs = a.target_epochs
+    steps_per_epoch = max(1, round(a.target_steps / epochs))
+    if steps_per_epoch >= full_pass:
+        steps_per_epoch = full_pass                # 打ち切り不要（0 = 無効を渡す）
+        epochs = max(3, round(a.target_steps / full_pass))
+    virtual = steps_per_epoch < full_pass
+
     beta_warmup = max(1, round(epochs * 0.10))
     val_ratio = min(1.0, max(0.02, round(a.val_target / max(1, n_val), 3)))
+    passes = a.target_steps * a.batch_size / max(1, n_eff)
 
-    # padded attention の相対コスト（PG パイロット = 1.0）。バッチ内最大原子数は
-    # 実質 p99 付近が支配する（1 件でも大きいと全件そこまでパディングされる）。
-    pad_index = a.batch_size * p99 * p99 / PG_PAD_INDEX
-    est_gb = PG_RESERVED_GB * pad_index
+    def vram(bs: float, npad: float) -> float:
+        """reserved GB の推定。npad = そのバッチ内の最大原子数。"""
+        return K_GB_PER_SAMPLE_ATOM2 * bs * npad * npad * RESERVED_OVER_ALLOC
+
+    # 学習を殺すのは「平均的なバッチ」ではなく**エポック中のピーク**なので、
+    # 判定はサンプル最大原子数を含むバッチで行う。1 エポックは数千バッチあるので
+    # 最大級の分子を含むバッチはほぼ確実に来る。
+    # 検証(2026-08-06): PG/bs128 でこの式が 2.58GB、実測 reserved 2.64GB ＝一致。
+    common_gb = vram(a.batch_size, p99)
+    peak_gb = vram(a.batch_size, float(smax))
+    cap_gb = vram(a.batch_size, float(a.max_atoms))
 
     print('=' * 68)
     print(' DATASET')
@@ -141,29 +175,46 @@ def main() -> None:
     print('=' * 68)
     print(f' BUDGET  (batch_size={a.batch_size}, target {a.target_steps:,} steps)')
     print('=' * 68)
-    print(f'  steps / epoch        : {steps_per_epoch:,}')
+    print(f'  full pass over train : {full_pass:,} steps')
+    print(f'  total data seen      : {passes:.1f} passes '
+          f'({a.target_steps * a.batch_size:,} samples)')
+    print(f'  -> steps_per_epoch   : {steps_per_epoch:,}'
+          + ('   (VIRTUAL epoch: truncated, reshuffled each epoch, no data discarded)'
+             if virtual else '   (= full pass; no truncation needed -> pass 0)'))
     print(f'  -> epochs            : {epochs}')
     print(f'  -> beta_warmup_epochs: {beta_warmup}   (10% of the run; '
           f'epoch-based in train.py)')
     print(f'  -> val_subset_ratio  : {val_ratio}   '
           f'(~{int(n_val * val_ratio):,} samples per validation)')
     print(f'  -> save_every        : 1   (1 epoch is already {steps_per_epoch:,} steps)')
+    if virtual:
+        print()
+        print('  WHY virtual epochs: CosineAnnealingLR steps ONCE per epoch, beta ramps')
+        print(f'  as (epoch-1)/warmup, and val/ckpt are per-epoch. A full pass here is')
+        print(f'  {full_pass:,} steps, so spending the budget in whole passes would leave only')
+        print(f'  {max(3, round(a.target_steps / full_pass))} epochs = a {max(3, round(a.target_steps / full_pass))}-point staircase for LR, beta and ckpt choice.')
     print()
     print('=' * 68)
     print(' VRAM (padded EGT attention scales as batch_size * max_atoms^2)')
     print('=' * 68)
-    print(f'  pad index vs PG pilot: {pad_index:.2f}x  '
-          f'(PG: bs64 x 60 atoms -> {PG_RESERVED_GB}GB reserved)')
-    print(f'  rough reserved est.  : {est_gb:.1f} GB')
-    if est_gb > 26:
-        print('  VERDICT: too tight for 32GB. Lower --batch_size '
-              '(re-run this script) or keep bs and rely on --oom_max_skips.')
-    elif est_gb > 18:
-        print('  VERDICT: fits, but spiky batches may OOM. '
-              'Use --oom_max_skips 20 so a rare heavy batch is dropped, '
-              'not the whole run.')
+    print(f'  common batch (N={p99:.0f})  : {common_gb:5.1f} GB reserved')
+    print(f'  PEAK   batch (N={smax:3d}) : {peak_gb:5.1f} GB reserved   '
+          f'<- this decides OOM (thousands of batches per epoch)')
+    print(f'  if a N={a.max_atoms} unit exists : {cap_gb:5.1f} GB reserved')
+    if peak_gb > 28:
+        print('  VERDICT: the peak batch will OOM on 32GB. Halve --batch_size and double')
+        print('           --grad_accum (effective batch and thus the loss curve are kept).')
+        print('           Do NOT just paper over it with --oom_max_skips: the dropped')
+        print('           batches are exactly the large units whose reconstruction is')
+        print('           the open problem, so it biases training away from them.')
+    elif peak_gb > 20:
+        print('  VERDICT: fits, but with little headroom. Keep --oom_max_skips 20 as a')
+        print('           safety net and watch the [VRAM] lines in the log.')
     else:
-        print('  VERDICT: comfortable on 32GB.')
+        print('  VERDICT: fits with headroom, peak included.')
+    print()
+    print('  This is a regression from measured points, not a measurement. Confirm with')
+    print('  --benchmark before committing to a batch size (command printed below).')
     print()
     print('=' * 68)
     print(' LAUNCH (32GB machine, detached)')
@@ -173,8 +224,16 @@ def main() -> None:
           '\'-ExecutionPolicy\',\'Bypass\',\'-File\',\'scripts/run_main_vae.ps1\',')
     print(f'    \'-Epochs\',\'{epochs}\',\'-BatchSize\',\'{a.batch_size}\','
           f'\'-BetaWarmupEpochs\',\'{beta_warmup}\',')
-    print(f'    \'-ValSubsetRatio\',\'{val_ratio}\',\'-SaveEvery\',\'1\','
+    print(f'    \'-StepsPerEpoch\',\'{steps_per_epoch if virtual else 0}\','
+          f'\'-ValSubsetRatio\',\'{val_ratio}\',\'-SaveEvery\',\'1\','
           f'\'-OomMaxSkips\',\'20\' -WindowStyle Hidden')
+    print()
+    print('  Measure the real VRAM first (the estimate above is a crude extrapolation):')
+    print(f'    & $env:POLY3D_PY scripts/train.py --stage vae --benchmark 30 \\')
+    print(f'      --train_lmdb {a.train_lmdb} --val_lmdb {a.val_lmdb} \\')
+    print(f'      --batch_size {a.batch_size} --hidden_dim 256 --edge_dim 128 \\')
+    print(f'      --vae_hidden_dim 256 --egt_every 2 --enc_egt_every 2 --max_atoms '
+          f'{a.max_atoms}')
     print('=' * 68)
 
 

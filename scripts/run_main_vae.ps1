@@ -37,6 +37,11 @@
 #   -SaveEvery         resume granularity; 1 epoch of the full set is hours.
 # Run scripts/suggest_vae_budget.py against the built lmdb to get the values (it reads the
 # real entry count and atom-size distribution and prints the launch line).
+#
+# On the full build a real epoch is ~100k steps, so honouring the step budget with whole
+# passes leaves only ~3 epochs = a 3-point staircase for LR, beta, val and ckpt selection.
+# -StepsPerEpoch cuts one epoch down to N batches (reshuffled every epoch, so no data is
+# discarded) which restores the resolution of every epoch-based schedule.
 
 param(
     [switch]$Live,
@@ -47,7 +52,8 @@ param(
     [int]$BetaWarmupEpochs = 20,
     [double]$ValSubsetRatio = 0.3,
     [int]$SaveEvery = 5,
-    [int]$OomMaxSkips = 0
+    [int]$OomMaxSkips = 0,
+    [int]$StepsPerEpoch = 0
 )
 
 if ($env:POLY3D_PY) { $py = $env:POLY3D_PY } else { $py = "python" }
@@ -95,6 +101,7 @@ if (-not (Done "TRAIN_DONE")) {
         "--val_subset_ratio",[string]$ValSubsetRatio,
         "--empty_cache_every","500","--num_workers","16","--prefetch_factor","4",
         "--save_every",[string]$SaveEvery,"--oom_max_skips",[string]$OomMaxSkips,
+        "--steps_per_epoch",[string]$StepsPerEpoch,
         "--seed","42","--gnorm_log_every","100"
     )
     $ck = LatestCkpt $out
