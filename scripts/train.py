@@ -1785,7 +1785,8 @@ def _benchmark_dit(trainer: DiTTrainer, n_batches: int):
     return timings
 
 
-def _print_benchmark(timings: dict, n_batches: int, total_batches_per_epoch: int, stage: str):
+def _print_benchmark(timings: dict, n_batches: int, total_batches_per_epoch: int, stage: str,
+                     epochs: int = 0, full_pass: int = 0):
     """ベンチマーク結果のフォーマット出力。"""
     print(f'\n{"="*60}')
     print(f'  Benchmark: {stage} ({n_batches} batches, warmup=3)')
@@ -1818,8 +1819,18 @@ def _print_benchmark(timings: dict, n_batches: int, total_batches_per_epoch: int
     est_epoch = avg_per_batch * total_batches_per_epoch
     est_h = est_epoch / 3600
     print(f'\n  平均バッチ時間: {avg_per_batch*1000:.1f} ms')
-    print(f'  1エポック推定 : {est_epoch:.0f}s ({est_h:.1f}h)')
-    print(f'  (全 {total_batches_per_epoch} バッチ)')
+    # total_batches_per_epoch は --steps_per_epoch を反映した「実際に回す1エポック」。
+    # 仮想エポック時に全件1パスの数字を出すと、それを 40 倍して総時間だと誤読される。
+    kind = ('仮想エポック' if full_pass and total_batches_per_epoch < full_pass
+            else '全件1パス')
+    print(f'  1エポック推定 : {est_epoch:.0f}s ({est_h:.1f}h)  '
+          f'[{kind}: {total_batches_per_epoch} バッチ]')
+    if full_pass and total_batches_per_epoch < full_pass:
+        print(f'  (参考: 全件1パスは {full_pass} バッチ = '
+              f'{avg_per_batch*full_pass/3600:.1f}h。これは回さない)')
+    if epochs:
+        print(f'  全学習推定    : {est_epoch*epochs/3600:.1f}h  '
+              f'(--epochs {epochs}, val 時間は別途)')
     if torch.cuda.is_available():
         # batch_size を決める材料。reserved がカード容量に対して余裕があるかを見る。
         # ただし計測は n_batches 分のサンプルなので、原子数分布の裾（稀に来る
@@ -1855,16 +1866,20 @@ if __name__ == '__main__':
             trainer = VAETrainer(args, local_rank)
             if args.benchmark > 0:
                 timings = _benchmark_vae(trainer, args.benchmark)
-                _print_benchmark(timings, args.benchmark,
-                                 len(trainer.train_loader), 'VAE')
+                _fp = len(trainer.train_loader)
+                _bpe = min(_fp, args.steps_per_epoch) if args.steps_per_epoch > 0 else _fp
+                _print_benchmark(timings, args.benchmark, _bpe, 'VAE',
+                                 epochs=args.epochs, full_pass=_fp)
             else:
                 trainer.run()
         else:
             trainer = DiTTrainer(args, local_rank)
             if args.benchmark > 0:
                 timings = _benchmark_dit(trainer, args.benchmark)
-                _print_benchmark(timings, args.benchmark,
-                                 len(trainer.train_loader), 'DiT')
+                _fp = len(trainer.train_loader)
+                _bpe = min(_fp, args.steps_per_epoch) if args.steps_per_epoch > 0 else _fp
+                _print_benchmark(timings, args.benchmark, _bpe, 'DiT',
+                                 epochs=args.epochs, full_pass=_fp)
             else:
                 trainer.run()
     finally:
