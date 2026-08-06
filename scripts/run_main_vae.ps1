@@ -42,6 +42,13 @@
 # passes leaves only ~3 epochs = a 3-point staircase for LR, beta, val and ckpt selection.
 # -StepsPerEpoch cuts one epoch down to N batches (reshuffled every epoch, so no data is
 # discarded) which restores the resolution of every epoch-based schedule.
+#
+# BATCH SIZE: VRAM is batch_size x (largest unit in the batch)^2 because the EGT global
+# attention is a dense (B, N_max, N_max) tensor -- a single 288-atom unit pads the whole
+# batch to 288. bs128 needs ~34GB in that case and does not fit; bs64 needs ~17GB and does.
+# Prefer -BatchSize 64 -GradAccum 2 over -BatchSize 128: the effective batch stays 128, so
+# lr 3e-4 and grad_clip 1.0 keep the calibration they were tuned at on the PG pilot.
+# Note -StepsPerEpoch counts LOADER batches, so optimizer steps per epoch = N / GradAccum.
 
 param(
     [switch]$Live,
@@ -53,7 +60,8 @@ param(
     [double]$ValSubsetRatio = 0.3,
     [int]$SaveEvery = 5,
     [int]$OomMaxSkips = 0,
-    [int]$StepsPerEpoch = 0
+    [int]$StepsPerEpoch = 0,
+    [int]$GradAccum = 1
 )
 
 if ($env:POLY3D_PY) { $py = $env:POLY3D_PY } else { $py = "python" }
@@ -81,7 +89,7 @@ function LatestCkpt($dir) {
 }
 
 if (-not (Test-Path $out)) { New-Item -ItemType Directory -Force -Path $out | Out-Null }
-"START $(Get-Date -Format o) width=$Width batch=$BatchSize epochs=$Epochs lr=$Lr pos_loss=multiscale_distmat beta=0->0.1(warmup$BetaWarmupEpochs) val_ratio=$ValSubsetRatio save_every=$SaveEvery oom_max_skips=$OomMaxSkips freeze_encoder=0 init=NONE (FROM-SCRATCH)" |
+"START $(Get-Date -Format o) width=$Width batch=$BatchSize accum=$GradAccum steps_per_epoch=$StepsPerEpoch epochs=$Epochs lr=$Lr pos_loss=multiscale_distmat beta=0->0.1(warmup$BetaWarmupEpochs) val_ratio=$ValSubsetRatio save_every=$SaveEvery oom_max_skips=$OomMaxSkips freeze_encoder=0 init=NONE (FROM-SCRATCH)" |
     Out-File -Append -Encoding ascii $status
 
 # ---- TRAIN: full VAE from scratch, multiscale recon + clash guard ------------
@@ -95,7 +103,8 @@ if (-not (Done "TRAIN_DONE")) {
         "--pos_loss_type","multiscale_distmat","--w_local","1.0","--w_global","1.0",
         "--w_pos","1.0","--w_bond","1.0","--w_angle","0.5","--w_dihedral","0.1",
         "--w_clash","5.0","--clash_factor","0.6","--clash_min_graph_dist","3","--clash_max_pairs","512",
-        "--batch_size",[string]$BatchSize,"--grad_accum","1","--epochs",[string]$Epochs,
+        "--batch_size",[string]$BatchSize,"--grad_accum",[string]$GradAccum,
+        "--epochs",[string]$Epochs,
         "--lr",[string]$Lr,"--lr_min","1e-5","--warmup_steps","500","--grad_clip","1.0",
         "--weight_decay","1e-5","--max_atoms","288",
         "--val_subset_ratio",[string]$ValSubsetRatio,

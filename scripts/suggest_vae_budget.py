@@ -187,6 +187,11 @@ def main() -> None:
     print(f'  -> val_subset_ratio  : {val_ratio}   '
           f'(~{int(n_val * val_ratio):,} samples per validation)')
     print(f'  -> save_every        : 1   (1 epoch is already {steps_per_epoch:,} steps)')
+    _accum = max(1, round(128 / a.batch_size))
+    if _accum > 1:
+        print(f'  -> grad_accum        : {_accum}   (effective batch '
+              f'{a.batch_size * _accum} = the PG-pilot value lr/grad_clip were tuned at; '
+              f'optimizer steps/epoch = {steps_per_epoch // _accum:,})')
     if virtual:
         print()
         print('  WHY virtual epochs: CosineAnnealingLR steps ONCE per epoch, beta ramps')
@@ -222,8 +227,11 @@ def main() -> None:
     print('  $env:POLY3D_PY = "C:/Users/shanu/anaconda3/envs/polygen/python.exe"')
     print('  Start-Process powershell -ArgumentList \'-NoProfile\','
           '\'-ExecutionPolicy\',\'Bypass\',\'-File\',\'scripts/run_main_vae.ps1\',')
+    # 実効バッチは PG パイロットと同じ 128 に揃える（lr 3e-4 / grad_clip 1.0 は
+    # その実効バッチで校正された値なので、bs を下げたら accum で埋め戻す）。
+    accum = max(1, round(128 / a.batch_size))
     print(f'    \'-Epochs\',\'{epochs}\',\'-BatchSize\',\'{a.batch_size}\','
-          f'\'-BetaWarmupEpochs\',\'{beta_warmup}\',')
+          f'\'-GradAccum\',\'{accum}\',\'-BetaWarmupEpochs\',\'{beta_warmup}\',')
     print(f'    \'-StepsPerEpoch\',\'{steps_per_epoch if virtual else 0}\','
           f'\'-ValSubsetRatio\',\'{val_ratio}\',\'-SaveEvery\',\'1\','
           f'\'-OomMaxSkips\',\'20\' -WindowStyle Hidden')
