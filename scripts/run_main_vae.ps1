@@ -27,12 +27,27 @@
 # Idempotent: resume own vae_epoch*.pt if present, else start from scratch.
 # -----------------------------------------------------------------------------
 
+# BUDGET NOTE: the defaults below are the PG-pilot scale (train 340k entries). On the
+# full 22-class build the train set is millions of entries, so 1 epoch is already tens of
+# thousands of steps. Three knobs MUST be rescaled together there, because all three are
+# epoch-based, not step-based:
+#   -Epochs            CosineAnnealingLR uses T_max=epochs, so this IS the LR decay length.
+#   -BetaWarmupEpochs  beta ramps as (epoch-1)/warmup; a warmup longer than the run means
+#                      beta never reaches 0.1.
+#   -SaveEvery         resume granularity; 1 epoch of the full set is hours.
+# Run scripts/suggest_vae_budget.py against the built lmdb to get the values (it reads the
+# real entry count and atom-size distribution and prints the launch line).
+
 param(
     [switch]$Live,
     [int]$Width = 256,
     [int]$BatchSize = 128,
     [int]$Epochs = 300,
-    [double]$Lr = 3e-4
+    [double]$Lr = 3e-4,
+    [int]$BetaWarmupEpochs = 20,
+    [double]$ValSubsetRatio = 0.3,
+    [int]$SaveEvery = 5,
+    [int]$OomMaxSkips = 0
 )
 
 if ($env:POLY3D_PY) { $py = $env:POLY3D_PY } else { $py = "python" }
@@ -60,7 +75,7 @@ function LatestCkpt($dir) {
 }
 
 if (-not (Test-Path $out)) { New-Item -ItemType Directory -Force -Path $out | Out-Null }
-"START $(Get-Date -Format o) width=$Width batch=$BatchSize epochs=$Epochs lr=$Lr pos_loss=multiscale_distmat beta=0->0.1(warmup20) freeze_encoder=0 init=NONE (FROM-SCRATCH)" |
+"START $(Get-Date -Format o) width=$Width batch=$BatchSize epochs=$Epochs lr=$Lr pos_loss=multiscale_distmat beta=0->0.1(warmup$BetaWarmupEpochs) val_ratio=$ValSubsetRatio save_every=$SaveEvery oom_max_skips=$OomMaxSkips freeze_encoder=0 init=NONE (FROM-SCRATCH)" |
     Out-File -Append -Encoding ascii $status
 
 # ---- TRAIN: full VAE from scratch, multiscale recon + clash guard ------------
@@ -70,15 +85,17 @@ if (-not (Done "TRAIN_DONE")) {
         "--hidden_dim",[string]$Width,"--edge_dim",[string]$edge,"--vae_hidden_dim",[string]$Width,
         "--cond_layers","4","--latent_dim","16","--enc_layers","4","--dec_layers","4",
         "--egt_every","2","--enc_egt_every","2",
-        "--beta_start","0","--beta_end","0.1","--beta_warmup_epochs","20",
+        "--beta_start","0","--beta_end","0.1","--beta_warmup_epochs",[string]$BetaWarmupEpochs,
         "--pos_loss_type","multiscale_distmat","--w_local","1.0","--w_global","1.0",
         "--w_pos","1.0","--w_bond","1.0","--w_angle","0.5","--w_dihedral","0.1",
         "--w_clash","5.0","--clash_factor","0.6","--clash_min_graph_dist","3","--clash_max_pairs","512",
         "--batch_size",[string]$BatchSize,"--grad_accum","1","--epochs",[string]$Epochs,
         "--lr",[string]$Lr,"--lr_min","1e-5","--warmup_steps","500","--grad_clip","1.0",
-        "--weight_decay","1e-5","--max_atoms","288","--val_subset_ratio","0.3",
+        "--weight_decay","1e-5","--max_atoms","288",
+        "--val_subset_ratio",[string]$ValSubsetRatio,
         "--empty_cache_every","500","--num_workers","16","--prefetch_factor","4",
-        "--save_every","5","--seed","42","--gnorm_log_every","100"
+        "--save_every",[string]$SaveEvery,"--oom_max_skips",[string]$OomMaxSkips,
+        "--seed","42","--gnorm_log_every","100"
     )
     $ck = LatestCkpt $out
     if ($ck) {

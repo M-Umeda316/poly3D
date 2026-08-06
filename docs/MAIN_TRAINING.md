@@ -54,9 +54,40 @@ Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass',
 | # | ランチャ | 内容 | 出力 | 完了後に確認 |
 |---|---|---|---|---|
 | 0 | `run_main_build.ps1` | 全クラスビルド(`--precompute_topology --per_cell_stride 1`)→uuid単位split。CPU | `data/polyomics_all_{train,val}.lmdb` | `runs/polyomics_main_build/build_out.log` の skip サマリ（multi_molecules/triclinic_box 等の警告件数） |
-| 1 | `run_main_vae.ps1` | Stage1 VAE from-scratch(multiscale, beta 0→0.1, bs128/300ep) | `runs/polyomics_main_vae/vae_best.pt`, `eval_recon.json` | recon 妥当性（サイズ帯別）、val_pos が上振れしないか |
+| 1 | `run_main_vae.ps1` | Stage1 VAE from-scratch(multiscale, beta 0→0.1)。**起動前に下記「学習予算の決め方」必読** | `runs/polyomics_main_vae/vae_best.pt`, `eval_recon.json` | recon 妥当性（サイズ帯別）、val_pos が上振れしないか |
 | 2 | `run_main_dit.ps1` | 潜在 precompute→DiT 学習(bs256/200ep)→eval dit | `runs/polyomics_main_dit/dit_best.pt`, `eval_dit_final.json` | dit 妥当性（サイズ帯別） |
 | 3 | `run_main_ditcons.ps1` | dit潜在 precompute→デコーダ仕上げ(freeze_encoder, w_ditcons/w_robust, 15ep) | `runs/polyomics_main_ditcons/eval_{recon,dit}_final.json` | 最終の生成妥当性（大単位が伸びたか） |
+
+### 学習予算の決め方（Stage1 VAE 起動前に必ず）
+
+`run_main_vae.ps1` の既定 `-Epochs 300 -BetaWarmupEpochs 20 -SaveEvery 5` は
+**PG 1クラス（train 34万件）のパイロット規模**の数字。全22クラスの本ビルドは
+train が数百万件になり、1 epoch がそのまま数万 step になるので、**epoch 基準の
+3つのパラメータを一緒にスケールし直さないと壊れる**:
+
+- `-Epochs`: `CosineAnnealingLR(T_max=epochs)` なので**これが LR を下げ切る長さそのもの**。
+  到達できない 300 を入れると LR が高いまま打ち切ることになる。
+- `-BetaWarmupEpochs`: beta は `(epoch-1)/warmup` の **epoch 基準**。総 epoch より
+  warmup が長いと **beta が 0.1 に到達しないまま学習が終わる**。
+- `-SaveEvery`: resume 粒度。本データは 1 epoch が数時間なので 1 にする。
+
+実件数と原子数分布から推奨値と起動コマンドを出すスクリプトを使う:
+
+```powershell
+& $env:POLY3D_PY scripts/suggest_vae_budget.py `
+    --train_lmdb data/polyomics_all_train.lmdb `
+    --val_lmdb   data/polyomics_all_val.lmdb --batch_size 128
+```
+
+出力の最後にそのまま貼れる `Start-Process ...` が出る。`--target_steps` が予算
+（既定 25万 step ＝ PG パイロットの best 相当 12万 step の約2倍）。
+
+**batch_size について**: EGT の大域アテンションは `(B, N_max, N_max)` の密テンソルで、
+VRAM は `batch_size × バッチ内最大原子数²`。PG は最大 79 原子だったが本データは
+`max_atoms=288` まで来るため、同じ bs でもピークが桁で変わる。スクリプトが PG 実測
+（bs64 / 60原子 → reserved 11.5GB）比の指数と概算 GB を出すので、それを見て決める。
+32GB 機で bs を上げるのは**この指数を確認してから**。稀な重量バッチで run ごと落とさない
+よう `-OomMaxSkips 20` を付けるのが安全（既定 0 ＝ fail-fast）。
 
 ### 進捗の見方
 - `status.txt`（ascii, bash-grep 可）: `..._START` → `..._DONE` → `ALL_DONE`。
