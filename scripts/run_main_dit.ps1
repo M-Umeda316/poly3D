@@ -22,7 +22,8 @@ param(
     [switch]$Live,
     [int]$BatchSize = 256,
     [int]$Epochs = 200,
-    [double]$Lr = 3e-4
+    [double]$Lr = 3e-4,
+    [string]$VaeRun = "polyomics_main_vae"
 )
 
 if ($env:POLY3D_PY) { $py = $env:POLY3D_PY } else { $py = "python" }
@@ -35,7 +36,7 @@ Set-Location $repo
 
 $out       = "runs/polyomics_main_dit"
 $status    = "$out/status.txt"
-$vae       = "runs/polyomics_main_vae/vae_best.pt"
+$vae       = "runs/$VaeRun/vae_best.pt"
 $trainLmdb = "data/polyomics_all_train.lmdb"
 $valLmdb   = "data/polyomics_all_val.lmdb"
 $latTrain  = "data/polyomics_all_latents_train.lmdb"

@@ -47,15 +47,26 @@
 # attention is a dense (B, N_max, N_max) tensor -- a single 288-atom unit pads the whole
 # batch to 288. bs128 needs ~34GB in that case and does not fit; bs64 needs ~17GB and does.
 # Prefer -BatchSize 64 -GradAccum 2 over -BatchSize 128: the effective batch stays 128, so
-# lr 3e-4 and grad_clip 1.0 keep the calibration they were tuned at on the PG pilot.
+# the lr and grad_clip keep the calibration they were tuned at on the PG pilot.
 # Note -StepsPerEpoch counts LOADER batches, so optimizer steps per epoch = N / GradAccum.
+#
+# LR WARNING (learned the hard way, twice) ------------------------------------
+# At width256 from-scratch, lr 3e-4 lands in a bad basin AND collapses the posterior.
+#   PG v3  (width256, from-scratch, lr 3e-4)   -> val_kl 0.0059, val_pos stalled. ABANDONED.
+#   PG v3b (width256, from-scratch, lr 1.5e-4, warmup 500) -> val_kl settles ~0.137. GOOD.
+#   MAIN 1st attempt (22-class, lr 3e-4, 80ep) -> val_kl 0.0009, recon validity 0.00. DEAD.
+# The default is therefore 1.5e-4, which is the only lr that has ever produced a healthy
+# width256 from-scratch VAE here. Do not raise it without a collapse-free result to point at.
+# Healthy-run tripwire: val_kl must stay above ~0.1 once beta reaches 0.1. If val_kl drops
+# below ~0.05 the posterior is collapsing -- kill the run, do not wait for it to finish.
 
 param(
     [switch]$Live,
     [int]$Width = 256,
     [int]$BatchSize = 128,
     [int]$Epochs = 300,
-    [double]$Lr = 3e-4,
+    [double]$Lr = 1.5e-4,
+    [string]$OutName = "polyomics_main_vae",
     [int]$BetaWarmupEpochs = 20,
     [double]$ValSubsetRatio = 0.3,
     [int]$SaveEvery = 5,
@@ -73,7 +84,7 @@ $env:PYTORCH_CUDA_ALLOC_CONF = "garbage_collection_threshold:0.6,max_split_size_
 Set-Location $repo
 
 $edge   = [int]($Width / 2)
-$out    = "runs/polyomics_main_vae"
+$out    = "runs/$OutName"
 $status = "$out/status.txt"
 $train  = "data/polyomics_all_train.lmdb"
 $val    = "data/polyomics_all_val.lmdb"

@@ -30,7 +30,8 @@ param(
     [double]$RobustNoiseStd = 0.35,
     [double]$WDitcons = 3.0,
     [int]$NSteps = 100,
-    [int]$NSamples = 1
+    [int]$NSamples = 1,
+    [string]$VaeRun = "polyomics_main_vae"
 )
 
 if ($env:POLY3D_PY) { $py = $env:POLY3D_PY } else { $py = "python" }
@@ -46,7 +47,7 @@ $out        = "runs/polyomics_main_ditcons"
 $status     = "$out/status.txt"
 $train      = "data/polyomics_all_train.lmdb"
 $val        = "data/polyomics_all_val.lmdb"
-$vae        = "runs/polyomics_main_vae/vae_best.pt"
+$vae        = "runs/$VaeRun/vae_best.pt"
 $ditCkpt    = "runs/polyomics_main_dit/dit_best.pt"
 $ditLatents = "data/polyomics_all_ditlatents.lmdb"
 

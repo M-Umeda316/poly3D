@@ -58,6 +58,47 @@ Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass',
 | 2 | `run_main_dit.ps1` | 潜在 precompute→DiT 学習(bs256/200ep)→eval dit | `runs/polyomics_main_dit/dit_best.pt`, `eval_dit_final.json` | dit 妥当性（サイズ帯別） |
 | 3 | `run_main_ditcons.ps1` | dit潜在 precompute→デコーダ仕上げ(freeze_encoder, w_ditcons/w_robust, 15ep) | `runs/polyomics_main_ditcons/eval_{recon,dit}_final.json` | 最終の生成妥当性（大単位が伸びたか） |
 
+### ★ 1回目の Stage1 は posterior collapse で全損（2026-08-17 記録）
+
+既定の `-Lr 3e-4` のまま 80 epoch 回して **完全に失敗**した。記録しておく:
+
+| | val_pos | val_kl | recon 妥当性 |
+|---|---|---|---|
+| 本学習 1回目（22クラス, width256, lr 3e-4, ep80）| 3.64 | **0.0009** | **0.00** |
+| PG v3b（width256, from-scratch, lr **1.5e-4**）| 0.187 | 0.137 | 健全 |
+| PG v3（width256, from-scratch, lr **3e-4**）| 0.705 | 0.0059 | 途中で破棄 |
+
+**lr 3e-4 × width256 の from-scratch は bad basin ＋ posterior collapse を起こす**、というのは
+PG パイロットの v3 で既に分かっていたのに、ランチャの既定値に反映されていなかった。
+`-Lr` の既定は **1.5e-4**（v3b で唯一 collapse せずに収束した値）に修正済み。
+
+**collapse のトリップワイヤ**: beta が 0.1 に到達したあと **val_kl が 0.1 を下回ったら赤信号、
+0.05 を切ったら即停止**。健全な run（v3b）は 0.137 で床を打ち、それ以下には行かない。
+80 epoch 完走を待ってから気付くと数日を捨てることになる。1回目は ep40 の時点で
+val_kl 0.013 まで落ちていて、そこで止められた。
+
+### 再走の手順
+
+1. **データを先に検査する**（GPU 数日を投じる前に、CPU 数分で潰す）:
+   ```powershell
+   & $env:POLY3D_PY scripts/check_lmdb_geometry.py `
+       --lmdb data/polyomics_all_train.lmdb --sample 5000 `
+       --out runs/data_check_train.json
+   ```
+   学習ターゲットである **GT 配座**が `eval_ensemble` と同じ妥当性ゲートを通るかを見る。
+   **PG（クリーンと実測済み）の基準値は GT 妥当率 0.995 / clash-free 1.000 / 結合長 p99 2.02Å**。
+   全22クラスがこれに近ければデータは白、大きく下回る帯・uuid があれば
+   そこはビルド（PBC アンラップ・キャップ）の失敗を疑う。PG 以外の21クラスの
+   GT 幾何は一度も検証していないので、ここは必ず通すこと。
+2. **出力先を変えて起動する**。ランチャは `vae_epoch*.pt` があれば自動 resume するので、
+   同じ `-OutName` で叩き直すと**壊れた ckpt から再開してしまう**:
+   ```powershell
+   Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass',
+     '-File','scripts/run_main_vae.ps1','-OutName','polyomics_main_vae2',
+     '-BatchSize','64','-GradAccum','2', ... -WindowStyle Hidden
+   ```
+   `-OutName` は Stage2/3 にも `-VaeRun` で渡す（`run_main_dit.ps1 -VaeRun polyomics_main_vae2`）。
+
 ### 学習予算の決め方（Stage1 VAE 起動前に必ず）
 
 `run_main_vae.ps1` の既定 `-Epochs 300 -BetaWarmupEpochs 20 -SaveEvery 5` は
