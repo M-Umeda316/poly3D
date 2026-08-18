@@ -30,14 +30,16 @@ from rdkit import Chem
 
 _PT = Chem.GetPeriodicTable()
 
-# eval_ensemble と同じサイズ帯
-SIZE_BANDS = [(0, 11), (11, 16), (16, 30), (30, 60), (60, 10 ** 9)]
+# eval_ensemble.py の _SIZE_BINS と同一にすること。ここがズレると
+# 「モデルの pass 率 vs その帯の GT 天井」を帯ごとに突き合わせられなくなる。
+SIZE_BINS = [0, 30, 50, 70, 10_000]
 
 
 def band_of(n_heavy: int) -> str:
-    for lo, hi in SIZE_BANDS:
+    for i in range(len(SIZE_BINS) - 1):
+        lo, hi = SIZE_BINS[i], SIZE_BINS[i + 1]
         if lo <= n_heavy < hi:
-            return f'[{lo},{hi})' if hi < 10 ** 9 else f'[{lo},+)'
+            return f'[{lo},{hi})' if hi < 10_000 else f'[{lo},+)'
     return 'unknown'
 
 
