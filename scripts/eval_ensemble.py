@@ -755,14 +755,21 @@ def _print_report(result: dict):
               f'{a["p90"]:>10.4f} {a["n"]:>5}')
 
     print(f'\n  ── サイズ帯別（重原子数）中央値 ──')
-    hdr = f'  {"帯":>10} {"n":>4}'
-    for k in ('torsion_js', 'tfd_median', 'cov_r', 'cov_p', 'mat_r', 'mat_p'):
-        hdr += f' {k:>9}'
+    # 妥当性 pass 率を先頭に置く。分布指標（torsion-JS/COV/MAT）は本データでは
+    # 判別力が弱いことが監査で分かっており、サイズ帯別の判断は pass 率で行う。
+    by_size_keys = ('validity_pass_rate', 'torsion_js', 'tfd_median',
+                    'cov_r', 'cov_p', 'mat_r', 'mat_p')
+    short = {'validity_pass_rate': 'pass率', 'torsion_js': 'torsionJS',
+             'tfd_median': 'TFD', 'cov_r': 'COV-R', 'cov_p': 'COV-P',
+             'mat_r': 'MAT-R', 'mat_p': 'MAT-P'}
+    hdr = f'  {"帯(重原子)":>12} {"n":>4}'
+    for k in by_size_keys:
+        hdr += f' {short[k]:>9}'
     print(hdr)
-    print('  ' + '-' * 70)
+    print('  ' + '-' * 82)
     for label, st in agg['by_size'].items():
-        line = f'  {label:>10} {st["n_uuid"]:>4}'
-        for k in ('torsion_js', 'tfd_median', 'cov_r', 'cov_p', 'mat_r', 'mat_p'):
+        line = f'  {label:>12} {st["n_uuid"]:>4}'
+        for k in by_size_keys:
             line += f' {st[k]["median"]:>9.4f}'
         print(line)
     print()
