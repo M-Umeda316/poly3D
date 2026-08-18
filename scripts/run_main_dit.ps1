@@ -18,10 +18,21 @@
 # Idempotent: each stage guarded by a status flag; DiT train resumes from latest ckpt.
 # -----------------------------------------------------------------------------
 
+# BUDGET NOTE (same trap as Stage 1; the old defaults were PG-pilot scale) -----
+# The full build has ~5.3M train entries. At bs256 a whole pass is ~20,700 steps, so
+# -Epochs 200 would be 4.1M steps -- 45x the PG pilot (150ep x 1,330 = ~200k steps,
+# best at ep69 = ~92k steps) and a multi-week run. CosineAnnealingLR(T_max=epochs)
+# also stretches the LR decay over that whole span.
+#
+# -StepsPerEpoch cuts one epoch to N batches (virtual epoch; the loader reshuffles every
+# epoch so no data is discarded). Default 2000 x 150ep = 300k steps, about 3x the PG
+# budget for ~15x the data, and every epoch-based schedule (LR, val, ckpt) keeps its
+# resolution. Pass 0 to go back to one whole pass per epoch (not advised here).
 param(
     [switch]$Live,
     [int]$BatchSize = 256,
-    [int]$Epochs = 200,
+    [int]$Epochs = 150,
+    [int]$StepsPerEpoch = 2000,
     [double]$Lr = 3e-4,
     [string]$VaeRun = "polyomics_main_vae"
 )
@@ -95,6 +106,7 @@ if (-not (Done "TRAIN_DONE")) {
         "--dit_hidden_dim","256","--dit_n_heads","8","--dit_n_layers","6",
         "--time_dim","64","--t_max","0.9","--p_selfcond","0.5",
         "--batch_size",[string]$BatchSize,"--epochs",[string]$Epochs,
+        "--steps_per_epoch",[string]$StepsPerEpoch,
         "--lr",[string]$Lr,"--lr_min","3e-5",
         "--weight_decay","1e-5","--grad_clip","1.0",
         "--warmup_steps","200","--warmup_start_factor","0.01",
