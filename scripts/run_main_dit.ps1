@@ -34,7 +34,10 @@ param(
     [int]$Epochs = 150,
     [int]$StepsPerEpoch = 2000,
     [double]$Lr = 3e-4,
-    [string]$VaeRun = "polyomics_main_vae"
+    [string]$VaeRun = "polyomics_main_vae",
+    [switch]$NoPrecompute,
+    [double]$LatentMapGb = 40,
+    [double]$ValLatentMapGb = 6
 )
 
 if ($env:POLY3D_PY) { $py = $env:POLY3D_PY } else { $py = "python" }
@@ -73,26 +76,43 @@ if (-not (Test-Path $out)) { New-Item -ItemType Directory -Force -Path $out | Ou
 "START $(Get-Date -Format o) vae=$vae batch=$BatchSize epochs=$Epochs lr=$Lr" |
     Out-File -Append -Encoding ascii $status
 
-# ---- Stage 1: precompute train latents ---------------------------------------
-if (-not (Done "PRECOMP_TRAIN_DONE")) {
-    "PRECOMP_TRAIN_START $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
-    & $py "scripts/precompute_latents.py" --vae_checkpoint $vae `
-        --src_lmdb $trainLmdb --out_lmdb $latTrain `
-        --batch_size 256 --num_workers 16 --max_atoms 288 --map_size_gb 40 `
-        1> "$out/precomp_train.log" 2> "$out/precomp_train.err"
-    if ($LASTEXITCODE -ne 0) { Fail "PRECOMP_TRAIN" $LASTEXITCODE }
-    "PRECOMP_TRAIN_DONE $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
-}
+# ---- Stage 1-2: precompute latents (optional) ---------------------------------
+# The latent cache is a speed optimisation, not a requirement: train.py falls back to
+# running cond_encoder + VAE encoder per batch when --latent_lmdb is omitted.
+# On the full build the cache is enormous. Measured on the PG cache: 41.8 KB/record at
+# PG's average unit size. The full build has ~5.3M train records and larger units, so
+# the train cache lands somewhere around 400-500 GB. Two things make that worse:
+#   - precompute_latents.py has NO resume. A failure restarts from record 0.
+#   - Windows LMDB allocates map_size NON-SPARSELY, so a big -LatentMapGb is consumed
+#     on disk the moment the file is created, whether or not it gets filled.
+# Hence -NoPrecompute, which skips both stages and trains straight off the raw lmdb.
+# Slower per step (the frozen encoders run every batch) but needs no extra disk.
+# The build already used --precompute_topology, so the loader is not BFS-bound.
+if ($NoPrecompute) {
+    "PRECOMP_SKIPPED $(Get-Date -Format o) - training directly off the raw lmdb" |
+        Out-File -Append -Encoding ascii $status
+} else {
+    if (-not (Done "PRECOMP_TRAIN_DONE")) {
+        "PRECOMP_TRAIN_START $(Get-Date -Format o) map_gb=$LatentMapGb" |
+            Out-File -Append -Encoding ascii $status
+        & $py "scripts/precompute_latents.py" --vae_checkpoint $vae `
+            --src_lmdb $trainLmdb --out_lmdb $latTrain `
+            --batch_size 256 --num_workers 16 --max_atoms 288 --map_size_gb $LatentMapGb `
+            1> "$out/precomp_train.log" 2> "$out/precomp_train.err"
+        if ($LASTEXITCODE -ne 0) { Fail "PRECOMP_TRAIN" $LASTEXITCODE }
+        "PRECOMP_TRAIN_DONE $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
+    }
 
-# ---- Stage 2: precompute val latents -----------------------------------------
-if (-not (Done "PRECOMP_VAL_DONE")) {
-    "PRECOMP_VAL_START $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
-    & $py "scripts/precompute_latents.py" --vae_checkpoint $vae `
-        --src_lmdb $valLmdb --out_lmdb $latVal `
-        --batch_size 256 --num_workers 16 --max_atoms 288 --map_size_gb 6 `
-        1> "$out/precomp_val.log" 2> "$out/precomp_val.err"
-    if ($LASTEXITCODE -ne 0) { Fail "PRECOMP_VAL" $LASTEXITCODE }
-    "PRECOMP_VAL_DONE $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
+    if (-not (Done "PRECOMP_VAL_DONE")) {
+        "PRECOMP_VAL_START $(Get-Date -Format o) map_gb=$ValLatentMapGb" |
+            Out-File -Append -Encoding ascii $status
+        & $py "scripts/precompute_latents.py" --vae_checkpoint $vae `
+            --src_lmdb $valLmdb --out_lmdb $latVal `
+            --batch_size 256 --num_workers 16 --max_atoms 288 --map_size_gb $ValLatentMapGb `
+            1> "$out/precomp_val.log" 2> "$out/precomp_val.err"
+        if ($LASTEXITCODE -ne 0) { Fail "PRECOMP_VAL" $LASTEXITCODE }
+        "PRECOMP_VAL_DONE $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
+    }
 }
 
 # ---- Stage 3: DiT flow-matching train ----------------------------------------
@@ -101,7 +121,6 @@ if (-not (Done "TRAIN_DONE")) {
         "--stage","dit",
         "--train_lmdb",$trainLmdb,"--val_lmdb",$valLmdb,
         "--vae_checkpoint",$vae,
-        "--latent_lmdb",$latTrain,"--latent_val_lmdb",$latVal,
         "--hidden_dim","256","--latent_dim","16",
         "--dit_hidden_dim","256","--dit_n_heads","8","--dit_n_layers","6",
         "--time_dim","64","--t_max","0.9","--p_selfcond","0.5",
@@ -115,12 +134,17 @@ if (-not (Done "TRAIN_DONE")) {
         "--save_every","1","--seed","42",
         "--out_dir",$out
     )
+    if (-not $NoPrecompute) {
+        $a += @("--latent_lmdb",$latTrain,"--latent_val_lmdb",$latVal)
+    }
     $ck = LatestCkpt $out
     if ($ck) {
         $a += @("--resume",$ck)
-        "TRAIN_START $(Get-Date -Format o) resume=$ck" | Out-File -Append -Encoding ascii $status
+        "TRAIN_START $(Get-Date -Format o) resume=$ck latent_cache=$(-not $NoPrecompute)" |
+            Out-File -Append -Encoding ascii $status
     } else {
-        "TRAIN_START $(Get-Date -Format o) fresh" | Out-File -Append -Encoding ascii $status
+        "TRAIN_START $(Get-Date -Format o) fresh latent_cache=$(-not $NoPrecompute)" |
+            Out-File -Append -Encoding ascii $status
     }
     if ($Live) {
         & $py "scripts/train.py" @a 1> "$out/dit_out.log"
