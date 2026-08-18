@@ -124,6 +124,39 @@ def _unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def _check_resume_schedule(ckpt: dict, epochs: int) -> None:
+    """--resume で学習長を伸ばそうとしていないかを検査し、危険なら即座に落とす。
+
+    CosineAnnealingLR の state_dict は T_max を含むので、`--resume` で読み込むと
+    `--epochs` に渡した新しい値は**上書きされて無視される**。そのうえ
+    CosineAnnealingLR の漸化式は T_max を超えると LR を下げ続けず、逆に
+    上昇に転じる（コサインが周期関数のため）。実測では T_max=80 の ckpt から
+    epochs=120 で resume すると lr が 1e-5 から **0.18 まで登り**、元の lr の
+    1200 倍に達する。数日回した収束済みモデルが一瞬で破壊される。
+
+    学習長を伸ばしたい場合は `--resume` ではなく `--init_weights` を使い、
+    optimizer/scheduler を fresh にして新しいコサインを張り直すこと。
+    （`--resume` 本来の用途＝クラッシュからの復帰では epochs は変えないので
+    この検査には掛からない。）
+    """
+    sched = ckpt.get('scheduler') or {}
+    saved_t_max = sched.get('T_max')
+
+    # 判定は T_max の一致のみで行う。ランチャの冪等 resume（同じ --epochs で
+    # 最新 ckpt から再開）は T_max が一致するので掛からない。最終 epoch 保存後の
+    # クラッシュ復帰（start_epoch > epochs で学習ループが空回りして正常終了）も
+    # 同様に通す。掛かるのは「--epochs を変えて resume した」場合だけ。
+    if saved_t_max is not None and int(saved_t_max) != int(epochs):
+        raise SystemExit(
+            f'[resume 不可] ckpt の scheduler は T_max={saved_t_max} で作られていますが '
+            f'--epochs は {epochs} です。\n'
+            f'  scheduler の state_dict は T_max を含むため --epochs は無視され、\n'
+            f'  T_max を超えた領域ではコサインが再上昇して LR が暴走します。\n'
+            f'  クラッシュ復帰なら --epochs {saved_t_max} に戻してください。\n'
+            f'  学習を延長したいなら --init_weights を使ってください。'
+        )
+
+
 def _all_reduce_dict(d: dict[str, float], n: int, device: torch.device) -> tuple[dict[str, float], int]:
     """
     各ランクの (sums_dict, count) を全ランクで集計し、グローバル合計を返す。
@@ -773,6 +806,7 @@ class VAETrainer:
 
     def _load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        _check_resume_schedule(ckpt, self.args.epochs)
         _unwrap(self.cond_encoder).load_state_dict(ckpt['cond_encoder'])
         _unwrap(self.vae).load_state_dict(ckpt['vae'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
@@ -1307,6 +1341,7 @@ class DiTTrainer:
 
     def _load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        _check_resume_schedule(ckpt, self.args.epochs)
         _unwrap(self.flow.model).load_state_dict(ckpt['flow'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
