@@ -37,7 +37,22 @@
 # measured ~2.8h for PG's 340k records at -NSteps 100, so the full build extrapolates to
 # ~40h+. -NSteps 20 cuts that ~5x and is the setting the original ditcons win (PG v3e,
 # runtime sampling at ditcons_steps 20) was actually produced with.
-# DO NOT try to shrink this by capping the record count instead. The pool is keyed by
+# -NoPrecompute skips the pool entirely and takes train.py's ORIGINAL runtime path
+# (--vae_dit_checkpoint + --ditcons_steps): the frozen DiT is loaded and z_dit is sampled
+# per batch, which is what the first ditcons win (PG v3e) actually used. Note this is a
+# DIFFERENT switch from run_main_dit.ps1 -NoPrecompute, which only drops a VAE latent
+# CACHE (pure speed, identical training). Here the pool IS the ditcons training signal,
+# so skipping it changes where that signal comes from, not whether there is one.
+# At this budget the runtime path is the cheaper one. Counting DiT batch-forwards:
+#   pool  -NSteps 100 : 82,800 batches x 100 = ~8.3M, paid up front
+#   pool  -NSteps 20  : 82,800 batches x  20 = ~1.7M, paid up front
+#   runtime (steps 20): 120,000 batches x 20 = ~2.4M, spread across training
+# The pool builds all 5.3M records once, but -StepsPerEpoch 8000 x 15ep only draws
+# 7.68M samples = ~1.45 visits per record, so most of that up-front work is not reused.
+# The runtime path also needs no 40 GB pool on disk, and it redraws the ODE noise on every
+# visit (-NSamples 1 freezes one z_dit per record), giving a more varied robustness signal.
+#
+# DO NOT try to shrink the pool by capping the record count instead. The pool is keyed by
 # record index and collate_fn only activates z_dit when EVERY record in the batch has one
 # ("has_zdit = all(...)" in dataset.py). A partial pool therefore yields mixed batches
 # that silently fall back to z_dit = None -- and because --dit_latent_lmdb suppresses the
@@ -56,6 +71,8 @@ param(
     [double]$WDitcons = 3.0,
     [int]$NSteps = 100,
     [int]$NSamples = 1,
+    [switch]$NoPrecompute,
+    [int]$DitconsSteps = 20,
     [double]$DitLatentMapGb = 40,
     [string]$VaeRun = "polyomics_main_vae"
 )
@@ -97,11 +114,14 @@ function Fail($tag, $ec) {
 }
 
 if (-not (Test-Path $out)) { New-Item -ItemType Directory -Force -Path $out | Out-Null }
-"START $(Get-Date -Format o) width=$Width epochs=$Epochs steps_per_epoch=$StepsPerEpoch lr=$Lr w_robust=$WRobust w_ditcons=$WDitcons n_steps=$NSteps pos_loss=multiscale_distmat init=$vae freeze_encoder=1 beta=0.1" |
+"START $(Get-Date -Format o) width=$Width epochs=$Epochs steps_per_epoch=$StepsPerEpoch lr=$Lr w_robust=$WRobust w_ditcons=$WDitcons zdit=$(if ($NoPrecompute) { "runtime(steps=$DitconsSteps)" } else { "pool(n_steps=$NSteps)" }) pos_loss=multiscale_distmat init=$vae freeze_encoder=1 beta=0.1" |
     Out-File -Append -Encoding ascii $status
 
 # ---- PRECOMPUTE dit-latents: reuse existing pool; make only if missing --------
-if (-not (Done "PRECOMPUTE_DONE")) {
+if ($NoPrecompute) {
+    "PRECOMPUTE_SKIPPED $(Get-Date -Format o) - runtime z_dit sampling, ditcons_steps=$DitconsSteps" |
+        Out-File -Append -Encoding ascii $status
+} elseif (-not (Done "PRECOMPUTE_DONE")) {
     if (Test-Path $ditLatents) {
         "PRECOMPUTE_DONE (reuse existing pool $ditLatents) $(Get-Date -Format o)" |
             Out-File -Append -Encoding ascii $status
@@ -131,7 +151,7 @@ if (-not (Done "TRAIN_DONE")) {
         "--w_pos","1.0","--w_bond","1.0","--w_angle","0.5","--w_dihedral","0.1",
         "--w_clash","5.0","--clash_factor","0.6","--clash_min_graph_dist","3","--clash_max_pairs","512",
         "--w_robust",[string]$WRobust,"--robust_noise_std",[string]$RobustNoiseStd,
-        "--w_ditcons",[string]$WDitcons,"--dit_latent_lmdb",$ditLatents,
+        "--w_ditcons",[string]$WDitcons,
         "--freeze_encoder",
         "--batch_size","64","--grad_accum","2","--epochs",[string]$Epochs,
         "--steps_per_epoch",[string]$StepsPerEpoch,
@@ -140,6 +160,13 @@ if (-not (Done "TRAIN_DONE")) {
         "--max_atoms","288","--val_subset_ratio","0.3","--empty_cache_every","500",
         "--num_workers","16","--prefetch_factor","4","--save_every","1","--seed","42"
     )
+    # Where z_dit comes from. These two are mutually exclusive in train.py: passing
+    # --dit_latent_lmdb suppresses the runtime DiT load, so a run must have exactly one.
+    if ($NoPrecompute) {
+        $a += @("--vae_dit_checkpoint",$ditCkpt,"--ditcons_steps",[string]$DitconsSteps)
+    } else {
+        $a += @("--dit_latent_lmdb",$ditLatents)
+    }
     $ck = LatestCkpt $out
     if ($ck) {
         $a += @("--resume",$ck)

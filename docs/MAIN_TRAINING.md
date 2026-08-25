@@ -174,6 +174,22 @@ Stage1・Stage2 と同じエポック規模の地雷が Stage3 にもあった�
 **40h 超**の外挿になる。`-NSteps 20` で約 1/5 になり、そもそも ditcons の最初の勝ち
 （PG v3e）は runtime サンプリングの `ditcons_steps 20` で出したものなので実績もある。
 
+**`-NoPrecompute` でプール自体を作らない選択**: train.py 本来の runtime 経路
+（`--vae_dit_checkpoint` + `--ditcons_steps`、＝PG v3e が最初の勝ちを出した経路）に切り替え、
+凍結 DiT から毎バッチ z_dit をサンプリングする。`run_main_dit.ps1 -NoPrecompute` とは
+**意味が違う**ので注意（あちらが省くのは VAE 潜在キャッシュ＝純粋な速度最適化で学習内容は不変。
+こちらのプールは ditcons の学習信号そのもの）。今の予算では runtime のほうが安い:
+
+| 方式 | DiT バッチ前進回数 |
+|---|---|
+| プール `-NSteps 100` | 82,800 × 100 = 約830万（前倒し） |
+| プール `-NSteps 20` | 82,800 × 20 = 約166万（前倒し） |
+| runtime `-DitconsSteps 20` | 120,000 × 20 = 約240万（学習中に分散） |
+
+プールは全 5.3M レコードを1回ずつ作るが、`-StepsPerEpoch 8000` × 15ep が引くのは 768万サンプル
+＝各レコード平均1.45回しか使わないので、前倒し分の多くが再利用されない。runtime なら 40GB の
+プールも不要で、再訪のたびに ODE ノイズを引き直す（`-NSamples 1` は z_dit を1個に固定する）。
+
 **★レコード数を削って短縮してはいけない**: プールはレコード index キーで、`collate_fn` は
 **バッチ内の全レコードが z_dit を持つときだけ**有効化する（`dataset.py` の `has_zdit = all(...)`）。
 部分プールだと混在バッチばかりになり z_dit が None に落ちるが、`--dit_latent_lmdb` 指定時は
