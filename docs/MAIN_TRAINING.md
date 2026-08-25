@@ -56,7 +56,7 @@ Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass',
 | 0 | `run_main_build.ps1` | 全クラスビルド(`--precompute_topology --per_cell_stride 1`)→uuid単位split。CPU | `data/polyomics_all_{train,val}.lmdb` | `runs/polyomics_main_build/build_out.log` の skip サマリ（multi_molecules/triclinic_box 等の警告件数） |
 | 1 | `run_main_vae.ps1` | Stage1 VAE from-scratch(multiscale, beta 0→0.1)。**起動前に下記「学習予算の決め方」必読** | `runs/polyomics_main_vae/vae_best.pt`, `eval_recon.json` | recon 妥当性（サイズ帯別）、val_pos が上振れしないか |
 | 2 | `run_main_dit.ps1` | 潜在 precompute→DiT 学習(bs256/200ep)→eval dit | `runs/polyomics_main_dit/dit_best.pt`, `eval_dit_final.json` | dit 妥当性（サイズ帯別） |
-| 3 | `run_main_ditcons.ps1` | dit潜在 precompute→デコーダ仕上げ(freeze_encoder, w_ditcons/w_robust, 15ep) | `runs/polyomics_main_ditcons/eval_{recon,dit}_final.json` | 最終の生成妥当性（大単位が伸びたか） |
+| 3 | `run_main_ditcons.ps1` | dit潜在 precompute→デコーダ仕上げ(freeze_encoder, w_ditcons/w_robust, 15ep×8000step)。**起動前に下記「Stage3 の予算」必読** | `runs/polyomics_main_ditcons/eval_{recon,dit}_final.json` | 最終の生成妥当性（大単位が伸びたか） |
 
 ### ★ 1回目の Stage1 は posterior collapse で全損（2026-08-17 記録）
 
@@ -158,6 +158,32 @@ VRAM は `batch_size × バッチ内最大原子数²`（`N_max` はバッチ内
 fail-fast）。ただし**捨てられるのは大単位を含むバッチ＝まさに再構築が課題の当の対象**
 なので、常用すると学習が難しい側から静かに逸れる。恒常的に溢れるなら bs を半分にして
 `--grad_accum` を倍にする（実効バッチが保たれるので損失曲線の比較性は維持される）。
+
+### Stage3 の予算（ditcons 起動前に必ず）
+
+Stage1・Stage2 と同じエポック規模の地雷が Stage3 にもあった（2026-08-25 に修正）。
+`-Epochs 15` は PG パイロット（train 34万件＝bs64 で 5,300 バッチ/epoch、全体で約 8万バッチ）の
+数字で、本ビルドは 1 epoch が約 83,000 バッチ＝**PG の全予算を 1 epoch で使い切る**。
+`--save_every 1` なので resume 粒度も 1 epoch ＝日単位になる。
+
+→ `-StepsPerEpoch`（既定 **8000**）で仮想エポックに切る。8000×15ep = 12万バッチ ＝ PG の約1.5倍で、
+`run_main_dit.ps1` が採った比率と揃えてある。grad_accum が 2 なので optimizer step は N/2。
+
+**precompute の所要時間**: プールはレコードごとに `-NSteps` 回の ODE を回す。
+`precompute_dit_latents.py` の実測が PG 34万件・NSteps 100 で約 2.8h なので、本ビルドは
+**40h 超**の外挿になる。`-NSteps 20` で約 1/5 になり、そもそも ditcons の最初の勝ち
+（PG v3e）は runtime サンプリングの `ditcons_steps 20` で出したものなので実績もある。
+
+**★レコード数を削って短縮してはいけない**: プールはレコード index キーで、`collate_fn` は
+**バッチ内の全レコードが z_dit を持つときだけ**有効化する（`dataset.py` の `has_zdit = all(...)`）。
+部分プールだと混在バッチばかりになり z_dit が None に落ちるが、`--dit_latent_lmdb` 指定時は
+runtime DiT をロードしない設計なのでフォールバック先が無く、**w_ditcons が静かに発火しなくなって
+ただの recon fine-tune に劣化する（エラーは出ない）**。加えて `split_lmdb.py` はソース順で書くので、
+index の先頭スライス＝最初の数クラスであってサンプルではない。
+
+**`-VaeRun` は Stage2 と同じ名前を渡すこと**。プールのファイル名は `-VaeRun` を含む
+（`data/polyomics_all_ditlatents_<VaeRun>.lmdb`）ので、別 VAE で作った古いプールを
+黙って再利用する事故は防いである。
 
 ### 進捗の見方
 - `status.txt`（ascii, bash-grep 可）: `..._START` → `..._DONE` → `ALL_DONE`。

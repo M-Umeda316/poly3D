@@ -20,17 +20,43 @@
 #     '-File','<repo>/scripts/run_main_ditcons.ps1' -WindowStyle Hidden -PassThru
 #   Foreground live: ... -File scripts/run_main_ditcons.ps1 -Live
 # -----------------------------------------------------------------------------
-
+#
+# BUDGET NOTE (the same epoch-scale trap that already bit Stage 1 and Stage 2) ---
+# -Epochs 15 is the PG-pilot number, where train was 340k records = 5,300 loader
+# batches per epoch at bs64, so the whole fine-tune was ~80k batches. The full build
+# has ~5.3M train records, where ONE epoch is ~83,000 batches -- the entire PG budget
+# per epoch, 1.24M batches over 15 epochs. --save_every 1 then puts the resume
+# granularity at one full epoch as well, which is days.
+# -StepsPerEpoch cuts an epoch to N loader batches (virtual epoch; the loader reshuffles
+# every epoch, so no data is discarded). The default 8,000 x 15ep = 120k batches is
+# ~1.5x the PG budget for ~15x the data, matching the ratio run_main_dit.ps1 uses.
+# Pass 0 for whole passes (not advised here). Note grad_accum is 2, so optimizer steps
+# per epoch = N / 2.
+#
+# PRECOMPUTE COST: the pool runs an -NSteps ODE per record. precompute_dit_latents.py
+# measured ~2.8h for PG's 340k records at -NSteps 100, so the full build extrapolates to
+# ~40h+. -NSteps 20 cuts that ~5x and is the setting the original ditcons win (PG v3e,
+# runtime sampling at ditcons_steps 20) was actually produced with.
+# DO NOT try to shrink this by capping the record count instead. The pool is keyed by
+# record index and collate_fn only activates z_dit when EVERY record in the batch has one
+# ("has_zdit = all(...)" in dataset.py). A partial pool therefore yields mixed batches
+# that silently fall back to z_dit = None -- and because --dit_latent_lmdb suppresses the
+# runtime DiT load, there is nothing to fall back TO, so w_ditcons quietly stops firing
+# and the stage degrades into a plain recon fine-tune with no error. On top of that,
+# split_lmdb.py writes records in source order, so a leading slice of the index range is
+# the first few classes, not a sample of the data.
 param(
     [switch]$Live,
     [int]$Width = 256,
     [int]$Epochs = 15,
+    [int]$StepsPerEpoch = 8000,
     [double]$Lr = 5e-5,
     [double]$WRobust = 3.0,
     [double]$RobustNoiseStd = 0.35,
     [double]$WDitcons = 3.0,
     [int]$NSteps = 100,
     [int]$NSamples = 1,
+    [double]$DitLatentMapGb = 40,
     [string]$VaeRun = "polyomics_main_vae"
 )
 
@@ -49,7 +75,10 @@ $train      = "data/polyomics_all_train.lmdb"
 $val        = "data/polyomics_all_val.lmdb"
 $vae        = "runs/$VaeRun/vae_best.pt"
 $ditCkpt    = "runs/polyomics_main_dit/dit_best.pt"
-$ditLatents = "data/polyomics_all_ditlatents.lmdb"
+# The pool is only valid for the encoder it was made with, and the PRECOMPUTE step below
+# reuses any pool that already exists. Keying the filename on -VaeRun keeps a pool built
+# for a different (e.g. the collapsed first-attempt) VAE from being silently reused.
+$ditLatents = "data/polyomics_all_ditlatents_$VaeRun.lmdb"
 
 function Done($tag) {
     return (Test-Path $status) -and (Select-String -Path $status -Pattern $tag -Quiet)
@@ -68,7 +97,7 @@ function Fail($tag, $ec) {
 }
 
 if (-not (Test-Path $out)) { New-Item -ItemType Directory -Force -Path $out | Out-Null }
-"START $(Get-Date -Format o) width=$Width epochs=$Epochs lr=$Lr w_robust=$WRobust w_ditcons=$WDitcons pos_loss=multiscale_distmat init=$vae freeze_encoder=1 beta=0.1" |
+"START $(Get-Date -Format o) width=$Width epochs=$Epochs steps_per_epoch=$StepsPerEpoch lr=$Lr w_robust=$WRobust w_ditcons=$WDitcons n_steps=$NSteps pos_loss=multiscale_distmat init=$vae freeze_encoder=1 beta=0.1" |
     Out-File -Append -Encoding ascii $status
 
 # ---- PRECOMPUTE dit-latents: reuse existing pool; make only if missing --------
@@ -83,7 +112,7 @@ if (-not (Done "PRECOMPUTE_DONE")) {
             --vae_checkpoint $vae --dit_checkpoint $ditCkpt `
             --src_lmdb $train --out_lmdb $ditLatents `
             --n_steps $NSteps --n_samples $NSamples `
-            --batch_size 64 --max_atoms 288 --map_size_gb 40 --num_workers 8 --log_every 100 `
+            --batch_size 64 --max_atoms 288 --map_size_gb $DitLatentMapGb --num_workers 8 --log_every 100 `
             1> "$out/precompute_out.log" 2> "$out/precompute_err.log"
         if ($LASTEXITCODE -ne 0) { Fail "PRECOMPUTE" $LASTEXITCODE }
         "PRECOMPUTE_DONE exit=0 $(Get-Date -Format o)" | Out-File -Append -Encoding ascii $status
@@ -105,6 +134,7 @@ if (-not (Done "TRAIN_DONE")) {
         "--w_ditcons",[string]$WDitcons,"--dit_latent_lmdb",$ditLatents,
         "--freeze_encoder",
         "--batch_size","64","--grad_accum","2","--epochs",[string]$Epochs,
+        "--steps_per_epoch",[string]$StepsPerEpoch,
         "--lr",[string]$Lr,"--lr_min","1e-5","--weight_decay","1e-5","--grad_clip","5.0",
         "--warmup_steps","200","--warmup_start_factor","0.05","--gnorm_log_every","100",
         "--max_atoms","288","--val_subset_ratio","0.3","--empty_cache_every","500",
